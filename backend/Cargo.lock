@@ -41,6 +41,7 @@ dependencies = [
  "ipnet",
  "md5",
  "postgres-types",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

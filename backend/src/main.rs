@@ -2,12 +2,14 @@ use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddr},
     ops::RangeInclusive,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
 use ipnet::Ipv4Net;
 use postgres_types::{FromSql, ToSql};
+use rand::random;
 use serde::Deserialize;
 use serde_json::{self, Value};
 use tokio::{
@@ -20,6 +22,7 @@ use tokio::{
 };
 use tokio_postgres::{Client, NoTls};
 use tracing::error;
+use tracing_subscriber;
 
 mod string;
 mod u16;
@@ -29,18 +32,14 @@ use varint::{read_var_int, read_var_int_from_stream};
 
 #[derive(Deserialize)]
 struct Config {
-    /// Path to the blacklist file (IP, CIDR, or range per line)
     blacklist_file: String,
-    /// Number of worker threads for scanning
     worker_count: usize,
-    /// Timeout for each connection attempt (milliseconds)
     timeout_ms: u64,
-    /// Interval between rechecks (milliseconds)
     worker_recheck: u64,
-    /// Delay between resyncs of the recheck worker (milliseconds)
     recheck_resync_delay: u64,
-    /// PostgreSQL connection string
     db_url: String,
+    enable_isp_scan: bool,
+    isp_scan_subnet: u8,
 }
 
 #[derive(Clone)]
@@ -75,7 +74,6 @@ fn parse_ip_range(range_str: &str) -> Option<RangeInclusive<Ipv4Addr>> {
 }
 
 async fn load_blacklist(path: &str) -> Result<Vec<BlacklistEntry>, std::io::Error> {
-    // Loads blacklist entries from a file, supporting single IPs, CIDRs, and ranges.
     let file = File::open(path).await?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -103,60 +101,86 @@ async fn load_blacklist(path: &str) -> Result<Vec<BlacklistEntry>, std::io::Erro
 }
 
 fn ip_in_blacklist(ip: &Ipv4Addr, blacklist: &[BlacklistEntry]) -> bool {
-    // Checks if an IP is in the blacklist.
     blacklist.iter().any(|entry| entry.contains(ip))
 }
 
-async fn handle_ip(addr: SocketAddr, db: Arc<Mutex<Client>>, timeout_duration: Duration) {
-    // Attempts to connect to a Minecraft server, fetch status, and store results in the database.
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip,
-        _ => return,
-    };
-    let port = addr.port();
-    match tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await {
-        Ok(Ok(mut stream)) => {
-            let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
-            if let Err(e) = stream.write_all(&handshake).await {
-                tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
-                return;
-            }
-            let status = create_status_request().await;
-            if let Err(e) = stream.write_all(&status).await {
-                tracing::warn!("{}:{} status request failed: {}", ip, port, e);
-                return;
-            }
-            let len = match read_var_int_from_stream(&mut stream).await {
-                Ok(l) => l,
-                Err(_) => {
-                    tracing::info!("{}:{} no response", ip, port);
+fn handle_ip(
+    addr: SocketAddr,
+    db: Arc<Mutex<Client>>,
+    timeout_duration: Duration,
+    config: Arc<Config>,
+    do_isp_scan: bool,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let ip = match addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            _ => return,
+        };
+        let port = addr.port();
+        match tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await {
+            Ok(Ok(mut stream)) => {
+                let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
+                if let Err(e) = stream.write_all(&handshake).await {
+                    tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
                     return;
                 }
-            };
-            let mut buffer = vec![0; len as usize];
-            if let Err(e) = stream.read_exact(&mut buffer).await {
-                tracing::warn!("{}:{} read failed: {}", ip, port, e);
-                return;
+                let status = create_status_request().await;
+                if let Err(e) = stream.write_all(&status).await {
+                    tracing::warn!("{}:{} status request failed: {}", ip, port, e);
+                    return;
+                }
+                let len = match read_var_int_from_stream(&mut stream).await {
+                    Ok(l) => l,
+                    Err(_) => {
+                        tracing::info!("{}:{} no response", ip, port);
+                        return;
+                    }
+                };
+                let mut buffer = vec![0; len as usize];
+                if let Err(e) = stream.read_exact(&mut buffer).await {
+                    tracing::warn!("{}:{} read failed: {}", ip, port, e);
+                    return;
+                }
+                let mut index = 0;
+                let _ = read_var_int(&buffer, Some(&mut index));
+                let response = read_string(&buffer, &mut index).ok();
+                let client = db.lock().await;
+                if let Some(resp) = response {
+                    tracing::debug!("Got response for {}:{}: {}", ip, port, resp);
+                    save_json(&addr.to_string(), &resp, &client).await;
+                    tracing::info!("{}:{} succeeded", ip, port);
+                    tracing::info!("Active server found: {}:{} | response: {}", ip, port, resp);
+                    drop(client);
+                    if config.enable_isp_scan && do_isp_scan {
+                        let prefix = config.isp_scan_subnet;
+                        let net = ipnet::Ipv4Net::new(ip, prefix)
+                            .unwrap_or_else(|_| ipnet::Ipv4Net::new(ip, 24).unwrap());
+                        use tokio::task::JoinSet;
+                        let mut join_set = JoinSet::new();
+                        let max_concurrent = 32;
+                        for subnet_ip in net.hosts() {
+                            if subnet_ip == ip {
+                                continue;
+                            }
+                            let socket = SocketAddr::new(subnet_ip.into(), port);
+                            let db = db.clone();
+                            let config = Arc::clone(&config);
+                            let timeout_duration = timeout_duration;
+                            join_set.spawn(handle_ip(socket, db, timeout_duration, config, false));
+                            if join_set.len() >= max_concurrent {
+                                let _ = join_set.join_next().await;
+                            }
+                        }
+
+                        while join_set.join_next().await.is_some() {}
+                    }
+                } else {
+                    tracing::info!("{}:{} invalid response", ip, port);
+                }
             }
-            let mut index = 0;
-            let _ = read_var_int(&buffer, Some(&mut index));
-            let response = read_string(&buffer, &mut index).ok();
-            let client = db.lock().await;
-            if let Some(resp) = response {
-                tracing::debug!("Got response for {}:{}: {}", ip, port, resp);
-                save_json(&addr.to_string(), &resp, &client).await;
-                tracing::info!("{}:{} succeeded", ip, port);
-            } else {
-                tracing::info!("{}:{} invalid response", ip, port);
-            }
+            _ => {}
         }
-        Ok(Err(e)) => {
-            tracing::info!("{}:{} connection refused: {}", ip, port, e);
-        }
-        Err(_) => {
-            tracing::info!("{}:{} timeout", ip, port);
-        }
-    }
+    })
 }
 
 pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
@@ -227,12 +251,21 @@ pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgr
             timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
-        -- Create validator status table
+        -- Create validator status table (for validator only)
         CREATE TABLE IF NOT EXISTS validator_status (
             id SERIAL PRIMARY KEY,
             ips_validated INTEGER NOT NULL,
             ips_active INTEGER NOT NULL,
             ips_validated_list TEXT[] NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Create scanner status table (for scanner only)
+        CREATE TABLE IF NOT EXISTS status (
+            id SERIAL PRIMARY KEY,
+            ips_scanned INTEGER NOT NULL,
+            ips_active INTEGER NOT NULL,
+            ips_active_list TEXT[] NOT NULL,
             timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
@@ -294,16 +327,12 @@ async fn create_status_request() -> Vec<u8> {
 }
 
 async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) {
-    println!(
-        "[DEBUG] save_json: called for addr={} json_str={}",
-        addr, json_str
-    );
     let json_str = json_str.replace("\\u0000", "").replace('\u{0000}', "");
     let json = serde_json::from_str(&json_str);
     let mut json: Value = match json {
         Ok(v) => v,
         Err(e) => {
-            println!("[DEBUG] save_json: JSON parse error: {}", e);
+            error!("save_json: JSON parse error: {}", e);
             return;
         }
     };
@@ -340,7 +369,6 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
         Ok(row) => row,
         Err(e) => {
             error!("Error querying database: {}", e);
-            println!("[DEBUG] save_json: Error querying database: {}", e);
             return;
         }
     };
@@ -366,10 +394,10 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
             Ok(row) => {
                 server_id = row.get::<_, i32>("id");
                 old_players_opt = old_players;
+                tracing::info!("Server rescanned: {} (id={})", addr, server_id);
             }
             Err(e) => {
                 error!("Error updating database: {}", e);
-                println!("[DEBUG] save_json: Error updating database: {}", e);
                 return;
             }
         }
@@ -393,10 +421,10 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
             Ok(row) => {
                 server_id = row.get::<_, i32>("id");
                 old_players_opt = None;
+                tracing::info!("New server added: {} (id={})", addr, server_id);
             }
             Err(e) => {
                 error!("Error inserting into database: {}", e);
-                println!("[DEBUG] save_json: Error inserting into database: {}", e);
                 return;
             }
         }
@@ -438,22 +466,12 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
                             }
                         }
                     };
-                    let res = client
+                    let _ = client
                         .execute(
                             "INSERT INTO player_actions (user_id, server_id, action) VALUES ($1, $2, $3)",
                             &[&user_id, &server_id, &ActionType::Joined],
                         )
                         .await;
-                    match res {
-                        Ok(rows) => println!(
-                            "[DEBUG] save_json: JOINED action insert result (first scan): {} row(s) affected for user_id={}, server_id={}",
-                            rows, user_id, server_id
-                        ),
-                        Err(e) => println!(
-                            "[DEBUG] save_json: JOINED action insert error (first scan): {} for user_id={}, server_id={}",
-                            e, user_id, server_id
-                        ),
-                    }
                 }
             }
         }
@@ -461,14 +479,7 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
 
     if let Some(old_players) = old_players_opt {
         if let Some(players) = players {
-            let old_online = old_players.online.unwrap_or(0);
-            let new_online = players.online.unwrap_or(0);
-            println!(
-                "[DEBUG] save_json: old_online={}, new_online={}",
-                old_online, new_online
-            );
             if old_players != players {
-                println!("[DEBUG] save_json: player sample changed, logging JOINED/LEFT actions");
                 let old_set: HashSet<_> = extract_players(Some(old_players)).into_iter().collect();
                 let new_set: HashSet<_> =
                     extract_players(Some(players.clone())).into_iter().collect();
@@ -510,25 +521,12 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
                         user_id = Some(id);
                     }
                     if let Some(user_id) = user_id {
-                        println!(
-                            "[DEBUG] save_json: inserting JOINED action for user_id={}, server_id={}",
-                            user_id, server_id
-                        );
-                        let res = client
+                        let _ = client
                             .execute(
                                 "INSERT INTO player_actions (user_id, server_id, action) VALUES ($1, $2, $3)",
                                 &[&user_id, &server_id, &ActionType::Joined],
                             )
                             .await;
-                        match res {
-                            Ok(rows) => println!(
-                                "[DEBUG] save_json: JOINED action insert result: {} row(s) affected",
-                                rows
-                            ),
-                            Err(e) => {
-                                println!("[DEBUG] save_json: JOINED action insert error: {}", e)
-                            }
-                        }
                     }
                 }
                 for (name, uuid) in old_set.difference(&new_set) {
@@ -569,25 +567,12 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
                         user_id = Some(res);
                     }
                     if let Some(user_id) = user_id {
-                        println!(
-                            "[DEBUG] save_json: inserting LEFT action for user_id={}, server_id={}",
-                            user_id, server_id
-                        );
-                        let res = client
+                        let _ = client
                             .execute(
                                 "INSERT INTO player_actions (user_id, server_id, action) VALUES ($1, $2, $3)",
                                 &[&user_id, &server_id, &ActionType::Left],
                             )
                             .await;
-                        match res {
-                            Ok(rows) => println!(
-                                "[DEBUG] save_json: LEFT action insert result: {} row(s) affected",
-                                rows
-                            ),
-                            Err(e) => {
-                                println!("[DEBUG] save_json: LEFT action insert error: {}", e)
-                            }
-                        }
                     }
                 }
             }
@@ -690,7 +675,8 @@ pub fn name_to_uuid(username: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    // Entry point: loads config, initializes DB, starts scanning workers.
+    tracing_subscriber::fmt::init();
+
     let mut args = std::env::args().skip(1);
     if let Some(arg1) = args.next() {
         if arg1 == "--test" {
@@ -719,7 +705,7 @@ async fn main() {
                 db_init(&client).await.expect("Failed to initialize DB");
                 let db = Arc::new(Mutex::new(client));
                 let timeout_duration = Duration::from_millis(config.timeout_ms);
-                handle_ip(socket, db, timeout_duration).await;
+                handle_ip(socket, db, timeout_duration, Arc::new(config), true).await;
                 tracing::info!("[main] handle_ip finished");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 return;
@@ -747,8 +733,8 @@ async fn main() {
     });
     db_init(&client).await.expect("Failed to initialize DB");
     let db = Arc::new(Mutex::new(client));
+    let seed: u64 = random();
     let rounds = 6;
-    let seed = 0xBABE_u64;
     let thread_count = config.worker_count;
     let timeout_duration = Duration::from_millis(config.timeout_ms);
     let recheck_duration = Duration::from_millis(config.worker_recheck);
@@ -757,6 +743,7 @@ async fn main() {
     } else {
         None
     };
+    let config = Arc::new(config);
     if thread_count == 0 {
         tracing::info!("worker_count is 0, scanning is disabled.");
     } else {
@@ -766,6 +753,7 @@ async fn main() {
         for t in 0..thread_count {
             let db = Arc::clone(&db);
             let blacklist = blacklist.clone();
+            let config_worker = Arc::clone(&config);
             let start = t as u64 * chunk_size;
             let end = if t == thread_count - 1 {
                 total_ips
@@ -773,23 +761,29 @@ async fn main() {
                 (t as u64 + 1) * chunk_size
             };
             handles.push(tokio::spawn(async move {
+                let config = config_worker;
                 loop {
                     for i in start..end {
                         let ip = permute_u32(i as u32, rounds, seed);
                         let ip_addr = Ipv4Addr::from(ip);
+                        tracing::debug!("[main scan] Checking IP: {}", ip_addr);
                         if ip_in_blacklist(&ip_addr, &blacklist) {
+                            tracing::debug!("[main scan] Skipping blacklisted IP: {}", ip_addr);
                             continue;
                         }
                         let socket = SocketAddr::new(ip_addr.into(), 25565);
-                        let res = timeout(
+                        let config = Arc::clone(&config);
+                        let _ = timeout(
                             timeout_duration,
-                            handle_ip(socket, Arc::clone(&db), timeout_duration),
+                            handle_ip(socket, Arc::clone(&db), timeout_duration, config, true),
                         )
                         .await;
-                        if res.is_err() {
-                            tracing::warn!("Timeout handling IP: {}", socket);
-                        }
                     }
+                    tracing::info!(
+                        "[main scan] Finished scan cycle for chunk: {}-{}",
+                        start,
+                        end
+                    );
                     tokio::time::sleep(recheck_duration).await;
                 }
             }));
@@ -805,6 +799,7 @@ async fn main() {
         let recheck_resync_delay = recheck_resync_delay.unwrap();
         let db = Arc::clone(&db);
         let blacklist = blacklist.clone();
+        let config = Arc::clone(&config);
         let worker_count = if config.worker_count == 0 {
             1
         } else {
@@ -842,24 +837,30 @@ async fn main() {
                 };
                 let chunk_size = ips.len().div_ceil(worker_count);
                 let mut handles = Vec::new();
-                for (i, chunk) in ips.chunks(chunk_size).enumerate() {
+                for (_i, chunk) in ips.chunks(chunk_size).enumerate() {
                     let db = Arc::clone(&db);
                     let blacklist = blacklist.clone();
+                    let config = Arc::clone(&config);
                     let chunk = chunk.to_vec();
+                    let timeout_duration = Duration::from_millis(config.timeout_ms);
                     handles.push(tokio::spawn(async move {
-                        for ip in chunk {
-                            tracing::debug!("rescanner worker {}: Rechecking {}", i, ip);
+                        for ip in &chunk {
+                            tracing::info!("Rescanning server: {}", ip);
                             if ip_in_blacklist(&ip, &blacklist) {
-                                tracing::debug!(
-                                    "rescanner worker {}: {} is blacklisted, skipping",
-                                    i,
-                                    ip
-                                );
+                                tracing::debug!("[rescanner] Skipping blacklisted IP: {}", ip);
                                 continue;
                             }
-                            let socket = SocketAddr::new(ip.into(), 25565);
-                            handle_ip(socket, Arc::clone(&db), recheck_duration).await;
+                            let socket = SocketAddr::new((*ip).into(), 25565);
+                            handle_ip(
+                                socket,
+                                Arc::clone(&db),
+                                timeout_duration,
+                                Arc::clone(&config),
+                                true,
+                            )
+                            .await;
                         }
+                        tracing::info!("[rescanner] Finished recheck chunk of {} IPs", chunk.len());
                     }));
                 }
                 for handle in handles {
