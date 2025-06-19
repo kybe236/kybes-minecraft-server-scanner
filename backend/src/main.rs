@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use deadpool_postgres::{Manager, Pool};
 use ipnet::Ipv4Net;
 use postgres_types::{FromSql, ToSql};
 use rand::random;
@@ -14,18 +15,20 @@ use serde::Deserialize;
 use serde_json::{self, Value};
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, BufReader},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::Mutex,
+    sync::Semaphore,
     time::timeout,
 };
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::NoTls;
 use tracing::{error, info};
 
 mod string;
 mod u16;
 mod varint;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use pin_utils::pin_mut;
 use string::read_string;
 use varint::{read_var_int, read_var_int_from_stream};
 
@@ -117,9 +120,10 @@ fn ip_in_blacklist(ip: &Ipv4Addr, blacklist: &Blacklist) -> bool {
     blacklist.contains(ip)
 }
 
+// Update handle_ip to accept Pool and use pool.get().await
 fn handle_ip(
     addr: SocketAddr,
-    db: Arc<Mutex<Client>>,
+    pool: Pool,
     timeout_duration: Duration,
     config: Arc<Config>,
     do_isp_scan: bool,
@@ -129,59 +133,46 @@ fn handle_ip(
             std::net::IpAddr::V4(ip) => ip,
             _ => return,
         };
-
         let port = addr.port();
         if let Ok(Ok(mut stream)) =
             tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await
         {
-            // send the handshake packet
             let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
             if let Err(e) = stream.write_all(&handshake).await {
                 tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
                 return;
             }
-
-            // send the status packet
             let status = create_status_request().await;
             if let Err(e) = stream.write_all(&status).await {
                 tracing::warn!("{}:{} status request failed: {}", ip, port, e);
                 return;
             }
-
-            // read the packet length
             let len = match read_var_int_from_stream(&mut stream).await {
                 Ok(l) => l,
                 Err(_) => {
                     return;
                 }
             };
-
-            // read the rest of the packet
             let mut buffer = vec![0; len as usize];
             if let Err(e) = stream.read_exact(&mut buffer).await {
                 tracing::warn!("{}:{} read failed: {}", ip, port, e);
                 return;
             }
-
             let mut index = 0;
-
-            // read the packet ID
             let _ = read_var_int(&buffer, Some(&mut index));
-
-            // read the response json
             let response = read_string(&buffer, &mut index).ok();
-
-            // get access to the db
-            let client = db.lock().await;
-
+            let client = match pool.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("DB pool error: {}", e);
+                    return;
+                }
+            };
             if let Some(resp) = response {
                 tracing::debug!("Got response for {}:{}", ip, port);
                 save_json(&addr.to_string(), &resp, &client).await;
-                drop(client);
-
                 if config.enable_isp_scan && do_isp_scan {
                     info!("{}:{} ISP scan enabled, scanning subnet", ip, port);
-
                     let prefix = config.isp_scan_subnet;
                     let net = ipnet::Ipv4Net::new(ip, prefix)
                         .unwrap_or_else(|_| ipnet::Ipv4Net::new(ip, 24).unwrap());
@@ -193,20 +184,187 @@ fn handle_ip(
                             continue;
                         }
                         let socket = SocketAddr::new(subnet_ip.into(), port);
-                        let db = db.clone();
+                        let pool = pool.clone();
                         let config = Arc::clone(&config);
                         let timeout_duration = timeout_duration;
-                        join_set.spawn(handle_ip(socket, db, timeout_duration, config, false));
+                        join_set.spawn(handle_ip(socket, pool, timeout_duration, config, false));
                         if join_set.len() >= max_concurrent {
                             let _ = join_set.join_next().await;
                         }
                     }
-
                     while join_set.join_next().await.is_some() {}
                 }
             }
         }
     })
+}
+
+// Update start_scanning_workers to use Pool
+async fn start_scanning_workers(
+    thread_count: usize,
+    pool: Pool,
+    blacklist: Blacklist,
+    config: Arc<Config>,
+    rounds: u8,
+    seed: u64,
+    timeout_duration: Duration,
+) {
+    if thread_count == 0 {
+        tracing::info!("worker_count is 0, scanning is disabled.");
+    } else {
+        let blacklist = blacklist.clone();
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            let total_ips = u64::from(u32::MAX) + 1;
+            let chunk_size = total_ips / thread_count as u64;
+            let mut handles = Vec::with_capacity(thread_count);
+            for t in 0..thread_count {
+                let pool = pool.clone();
+                let blacklist = blacklist.clone();
+                let config_worker = Arc::clone(&config);
+                let start = t as u64 * chunk_size;
+                let end = if t == thread_count - 1 {
+                    total_ips
+                } else {
+                    (t as u64 + 1) * chunk_size
+                };
+                handles.push(tokio::spawn(async move {
+                    let config = config_worker;
+                    loop {
+                        for i in start..end {
+                            let ip = permute_u32(i as u32, rounds, seed);
+                            let ip_addr = Ipv4Addr::from(ip);
+                            if ip_in_blacklist(&ip_addr, &blacklist) {
+                                continue;
+                            }
+                            let socket = SocketAddr::new(ip_addr.into(), 25565);
+                            let config = Arc::clone(&config);
+                            let _ = timeout(
+                                timeout_duration,
+                                handle_ip(socket, pool.clone(), timeout_duration, config, true),
+                            )
+                            .await;
+                        }
+                        tracing::info!(
+                            "[main scan] Finished scan cycle for chunk: {}-{}",
+                            start,
+                            end
+                        );
+                    }
+                }));
+            }
+            for handle in handles {
+                let res = handle.await;
+                if res.is_err() {
+                    tracing::error!("Task failed: {:?}", res);
+                }
+            }
+        });
+    }
+}
+
+// Update start_rescanner to use Pool
+async fn start_rescanner(pool: Pool, blacklist: Blacklist, config: Arc<Config>) {
+    if config.worker_recheck != 0 {
+        let blacklist = blacklist.clone();
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            // Create concurrency limiter
+            let semaphore = Arc::new(Semaphore::new(config.worker_recheck as usize));
+
+            loop {
+                let client = match pool.get().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("DB pool error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                // Stream results instead of loading all at once
+                let stream = match client
+                    .query_raw("SELECT ip FROM servers", &[] as &[&str])
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to fetch IPs: {}", e);
+                        continue;
+                    }
+                };
+
+                pin_mut!(stream);
+                let mut tasks = FuturesUnordered::new();
+
+                while let Some(row) = stream.next().await {
+                    let row = match row {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("Row error: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let ip_port: String = row.get(0);
+
+                    // Parse IP (same as before)
+                    let (ip, port) = match parse_ip_port(&ip_port) {
+                        Some(pair) => pair,
+                        None => continue,
+                    };
+
+                    if ip_in_blacklist(&ip, &blacklist) {
+                        continue;
+                    }
+
+                    // Acquire concurrency permit
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // Semaphore closed
+                    };
+
+                    let task = {
+                        let pool = pool.clone();
+                        let config = Arc::clone(&config);
+                        let timeout_duration = Duration::from_millis(config.timeout_ms);
+
+                        tokio::spawn(async move {
+                            let _permit = permit; // Held for task duration
+
+                            let socket = SocketAddr::new(ip.into(), port);
+                            handle_ip(
+                                socket,
+                                pool.clone(),
+                                timeout_duration,
+                                Arc::clone(&config),
+                                false,
+                            )
+                            .await;
+                        })
+                    };
+
+                    tasks.push(task);
+                }
+
+                // Wait for current batch to complete
+                while tasks.next().await.is_some() {}
+
+                tracing::info!("[Rescanner] Cycle completed");
+            }
+        });
+    }
+}
+
+// Helper function to parse IP:PORT
+fn parse_ip_port(s: &str) -> Option<(Ipv4Addr, u16)> {
+    let mut parts = s.split(':');
+    let ip_str = parts.next()?;
+    let port_str = parts.next().unwrap_or("25565");
+
+    let ip = ip_str.parse().ok()?;
+    let port = port_str.parse().unwrap_or(25565);
+    Some((ip, port))
 }
 
 pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
@@ -784,146 +942,6 @@ pub fn name_to_uuid(username: &str) -> String {
     )
 }
 
-async fn start_scanning_workers(
-    thread_count: usize,
-    db: Arc<Mutex<Client>>,
-    blacklist: Blacklist,
-    config: Arc<Config>,
-    rounds: u8,
-    seed: u64,
-    timeout_duration: Duration,
-) {
-    if thread_count == 0 {
-        tracing::info!("worker_count is 0, scanning is disabled.");
-    } else {
-        let db = Arc::clone(&db);
-        let blacklist = blacklist.clone();
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            let total_ips = u64::from(u32::MAX) + 1;
-            let chunk_size = total_ips / thread_count as u64;
-            let mut handles = Vec::with_capacity(thread_count);
-            for t in 0..thread_count {
-                let db = Arc::clone(&db);
-                let blacklist = blacklist.clone();
-                let config_worker = Arc::clone(&config);
-                let start = t as u64 * chunk_size;
-                let end = if t == thread_count - 1 {
-                    total_ips
-                } else {
-                    (t as u64 + 1) * chunk_size
-                };
-                handles.push(tokio::spawn(async move {
-                    let config = config_worker;
-                    loop {
-                        for i in start..end {
-                            let ip = permute_u32(i as u32, rounds, seed);
-                            let ip_addr = Ipv4Addr::from(ip);
-                            if ip_in_blacklist(&ip_addr, &blacklist) {
-                                continue;
-                            }
-                            let socket = SocketAddr::new(ip_addr.into(), 25565);
-                            let config = Arc::clone(&config);
-                            let _ = timeout(
-                                timeout_duration,
-                                handle_ip(socket, Arc::clone(&db), timeout_duration, config, true),
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            "[main scan] Finished scan cycle for chunk: {}-{}",
-                            start,
-                            end
-                        );
-                    }
-                }));
-            }
-            for handle in handles {
-                let res = handle.await;
-                if res.is_err() {
-                    tracing::error!("Task failed: {:?}", res);
-                }
-            }
-        });
-    }
-}
-
-async fn start_rescanner(db: Arc<Mutex<Client>>, blacklist: Blacklist, config: Arc<Config>) {
-    if config.worker_recheck != 0 {
-        let db = Arc::clone(&db);
-        let blacklist = blacklist.clone();
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            loop {
-                let ips_ports: Vec<(Ipv4Addr, u16)> = {
-                    let db_guard = db.lock().await;
-                    let rows = db_guard.query("SELECT ip FROM servers", &[]).await;
-                    match rows {
-                        Ok(rows) => {
-                            let mut ips_ports = Vec::new();
-                            for row in rows.iter() {
-                                let ip_port = row.get::<_, String>(0);
-                                let mut split = ip_port.split(':');
-                                let ip_part = split.next();
-                                let port_part = split.next();
-                                let ip: Option<Ipv4Addr> = ip_part.and_then(|s| s.parse().ok());
-                                let port: u16 =
-                                    port_part.and_then(|s| s.parse().ok()).unwrap_or(25565);
-                                if let Some(ip) = ip {
-                                    ips_ports.push((ip, port));
-                                } else {
-                                    tracing::warn!(
-                                        "[rescanner] Could not parse IP from '{}', skipping",
-                                        ip_port
-                                    );
-                                }
-                            }
-                            tracing::info!("[rescanner] Got {} IPs from DB", ips_ports.len());
-                            ips_ports
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to fetch IPs from DB: {}", e);
-                            Vec::new()
-                        }
-                    }
-                };
-                let chunk_size = ips_ports.len().div_ceil(config.worker_recheck as usize);
-                let mut handles = Vec::new();
-                for chunk in ips_ports.chunks(chunk_size) {
-                    let db = Arc::clone(&db);
-                    let blacklist = blacklist.clone();
-                    let config = Arc::clone(&config);
-                    let chunk = chunk.to_vec();
-                    let timeout_duration = Duration::from_millis(config.timeout_ms);
-                    handles.push(tokio::spawn(async move {
-                        for (ip, port) in &chunk {
-                            if ip_in_blacklist(ip, &blacklist) {
-                                continue;
-                            }
-                            let socket = SocketAddr::new((*ip).into(), *port);
-                            handle_ip(
-                                socket,
-                                Arc::clone(&db),
-                                timeout_duration,
-                                Arc::clone(&config),
-                                false,
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            "[rescanner] Finished recheck chunk of {} servers",
-                            chunk.len()
-                        );
-                    }));
-                }
-                for handle in handles {
-                    let _ = handle.await;
-                }
-            }
-        });
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -946,18 +964,23 @@ async fn main() {
                     .await
                     .expect("Failed to read config.toml");
                 let config: Config = toml::from_str(&config_data).expect("Invalid config format");
-                let (client, connection) = tokio_postgres::connect(&config.db_url, NoTls)
-                    .await
-                    .expect("Failed to connect to DB");
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        tracing::error!("DB connection error: {}", e);
-                    }
-                });
+                let pg_config = config
+                    .db_url
+                    .parse::<tokio_postgres::Config>()
+                    .expect("Invalid db_url");
+                let mgr = Manager::new(pg_config, NoTls);
+                let pool = Pool::builder(mgr).max_size(16).build().unwrap();
+                let client = pool.get().await.expect("Failed to get DB client");
                 db_init(&client).await.expect("Failed to initialize DB");
-                let db = Arc::new(Mutex::new(client));
                 let timeout_duration = Duration::from_millis(config.timeout_ms);
-                handle_ip(socket, db, timeout_duration, Arc::new(config), true).await;
+                handle_ip(
+                    socket,
+                    pool.clone(),
+                    timeout_duration,
+                    Arc::new(config),
+                    true,
+                )
+                .await;
                 tracing::info!("[main] handle_ip finished");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 return;
@@ -977,20 +1000,14 @@ async fn main() {
     let blacklist = load_blacklist(&config.blacklist_file)
         .await
         .expect("Failed to load blacklist");
-
-    // connect to the db
-    let (client, connection) = tokio_postgres::connect(&config.db_url, NoTls)
-        .await
-        .expect("Failed to connect to DB");
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::error!("DB connection error: {}", e);
-        }
-    });
-
-    // create tables if not existing
+    let pg_config = config
+        .db_url
+        .parse::<tokio_postgres::Config>()
+        .expect("Invalid db_url");
+    let mgr = Manager::new(pg_config, NoTls);
+    let pool = Pool::builder(mgr).max_size(64).build().unwrap();
+    let client = pool.get().await.expect("Failed to get DB client");
     db_init(&client).await.expect("Failed to initialize DB");
-    let db = Arc::new(Mutex::new(client));
 
     // random seed for the ipv4 shuffler
     let seed: u64 = random();
@@ -1001,7 +1018,7 @@ async fn main() {
     let config = Arc::new(config);
     start_scanning_workers(
         thread_count,
-        Arc::clone(&db),
+        pool.clone(),
         blacklist.clone(),
         Arc::clone(&config),
         rounds,
@@ -1010,7 +1027,7 @@ async fn main() {
     )
     .await;
 
-    start_rescanner(Arc::clone(&db), blacklist.clone(), Arc::clone(&config)).await;
+    start_rescanner(pool.clone(), blacklist.clone(), Arc::clone(&config)).await;
 
     tokio::signal::ctrl_c()
         .await

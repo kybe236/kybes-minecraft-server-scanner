@@ -16,3 +16,6 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 uuid = { version = "1.17.0", features = ["v4"] }
 rand = "0.9.1"
+deadpool-postgres = "0.14.1"
+futures = "0.3.31"
+pin-utils = "0.1.0"
