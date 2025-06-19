@@ -22,7 +22,6 @@ use tokio::{
 };
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info};
-use tracing_subscriber;
 
 mod string;
 mod u16;
@@ -41,20 +40,29 @@ struct Config {
     isp_scan_subnet: u8,
 }
 
-#[derive(Clone)]
-enum BlacklistEntry {
-    Single(Ipv4Addr),
-    Cidr(Ipv4Net),
-    Range(RangeInclusive<Ipv4Addr>),
+#[derive(Clone, Default)]
+struct Blacklist {
+    singles: HashSet<Ipv4Addr>,
+    cidrs: Vec<Ipv4Net>,
+    ranges: Vec<RangeInclusive<Ipv4Addr>>,
 }
 
-impl BlacklistEntry {
+impl Blacklist {
     fn contains(&self, ip: &Ipv4Addr) -> bool {
-        match self {
-            BlacklistEntry::Single(a) => a == ip,
-            BlacklistEntry::Cidr(net) => net.contains(ip),
-            BlacklistEntry::Range(range) => range.contains(ip),
+        if self.singles.contains(ip) {
+            return true;
         }
+        for cidr in &self.cidrs {
+            if cidr.contains(ip) {
+                return true;
+            }
+        }
+        for range in &self.ranges {
+            if range.contains(ip) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -72,35 +80,41 @@ fn parse_ip_range(range_str: &str) -> Option<RangeInclusive<Ipv4Addr>> {
     }
 }
 
-async fn load_blacklist(path: &str) -> Result<Vec<BlacklistEntry>, std::io::Error> {
+async fn load_blacklist(path: &str) -> Result<Blacklist, std::io::Error> {
     let file = File::open(path).await?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
-    let mut entries = Vec::new();
+    let mut singles = HashSet::new();
+    let mut cidrs = Vec::new();
+    let mut ranges = Vec::new();
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Ok(ip) = line.parse::<Ipv4Addr>() {
-            entries.push(BlacklistEntry::Single(ip));
+            singles.insert(ip);
             continue;
         }
         if let Ok(cidr) = line.parse::<Ipv4Net>() {
-            entries.push(BlacklistEntry::Cidr(cidr));
+            cidrs.push(cidr);
             continue;
         }
         if let Some(range) = parse_ip_range(line) {
-            entries.push(BlacklistEntry::Range(range));
+            ranges.push(range);
             continue;
         }
         eprintln!("[WARN] Ignoring invalid blacklist line: {}", line);
     }
-    Ok(entries)
+    Ok(Blacklist {
+        singles,
+        cidrs,
+        ranges,
+    })
 }
 
-fn ip_in_blacklist(ip: &Ipv4Addr, blacklist: &[BlacklistEntry]) -> bool {
-    blacklist.iter().any(|entry| entry.contains(ip))
+fn ip_in_blacklist(ip: &Ipv4Addr, blacklist: &Blacklist) -> bool {
+    blacklist.contains(ip)
 }
 
 fn handle_ip(
@@ -117,81 +131,80 @@ fn handle_ip(
         };
 
         let port = addr.port();
-        match tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await {
-            Ok(Ok(mut stream)) => {
-                // send the handshake packet
-                let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
-                if let Err(e) = stream.write_all(&handshake).await {
-                    tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
+        if let Ok(Ok(mut stream)) =
+            tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await
+        {
+            // send the handshake packet
+            let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
+            if let Err(e) = stream.write_all(&handshake).await {
+                tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
+                return;
+            }
+
+            // send the status packet
+            let status = create_status_request().await;
+            if let Err(e) = stream.write_all(&status).await {
+                tracing::warn!("{}:{} status request failed: {}", ip, port, e);
+                return;
+            }
+
+            // read the packet length
+            let len = match read_var_int_from_stream(&mut stream).await {
+                Ok(l) => l,
+                Err(_) => {
                     return;
                 }
+            };
 
-                // send the status packet
-                let status = create_status_request().await;
-                if let Err(e) = stream.write_all(&status).await {
-                    tracing::warn!("{}:{} status request failed: {}", ip, port, e);
-                    return;
-                }
+            // read the rest of the packet
+            let mut buffer = vec![0; len as usize];
+            if let Err(e) = stream.read_exact(&mut buffer).await {
+                tracing::warn!("{}:{} read failed: {}", ip, port, e);
+                return;
+            }
 
-                // read the packet length
-                let len = match read_var_int_from_stream(&mut stream).await {
-                    Ok(l) => l,
-                    Err(_) => {
-                        return;
-                    }
-                };
+            let mut index = 0;
 
-                // read the rest of the packet
-                let mut buffer = vec![0; len as usize];
-                if let Err(e) = stream.read_exact(&mut buffer).await {
-                    tracing::warn!("{}:{} read failed: {}", ip, port, e);
-                    return;
-                }
+            // read the packet ID
+            let _ = read_var_int(&buffer, Some(&mut index));
 
-                let mut index = 0;
+            // read the response json
+            let response = read_string(&buffer, &mut index).ok();
 
-                // read the packet ID
-                let _ = read_var_int(&buffer, Some(&mut index));
+            // get access to the db
+            let client = db.lock().await;
 
-                // read the response json
-                let response = read_string(&buffer, &mut index).ok();
+            if let Some(resp) = response {
+                tracing::debug!("Got response for {}:{}", ip, port);
+                save_json(&addr.to_string(), &resp, &client).await;
+                drop(client);
 
-                // get access to the db
-                let client = db.lock().await;
+                if config.enable_isp_scan && do_isp_scan {
+                    info!("{}:{} ISP scan enabled, scanning subnet", ip, port);
 
-                if let Some(resp) = response {
-                    tracing::debug!("Got response for {}:{}", ip, port);
-                    save_json(&addr.to_string(), &resp, &client).await;
-                    drop(client);
-
-                    if config.enable_isp_scan && do_isp_scan {
-                        info!("{}:{} ISP scan enabled, scanning subnet", ip, port);
-
-                        let prefix = config.isp_scan_subnet;
-                        let net = ipnet::Ipv4Net::new(ip, prefix)
-                            .unwrap_or_else(|_| ipnet::Ipv4Net::new(ip, 24).unwrap());
-                        use tokio::task::JoinSet;
-                        let mut join_set = JoinSet::new();
-                        let max_concurrent = 32;
-                        for subnet_ip in net.hosts() {
-                            if subnet_ip == ip {
-                                continue;
-                            }
-                            let socket = SocketAddr::new(subnet_ip.into(), port);
-                            let db = db.clone();
-                            let config = Arc::clone(&config);
-                            let timeout_duration = timeout_duration;
-                            join_set.spawn(handle_ip(socket, db, timeout_duration, config, false));
-                            if join_set.len() >= max_concurrent {
-                                let _ = join_set.join_next().await;
-                            }
+                    let prefix = config.isp_scan_subnet;
+                    let net = ipnet::Ipv4Net::new(ip, prefix)
+                        .unwrap_or_else(|_| ipnet::Ipv4Net::new(ip, 24).unwrap());
+                    use tokio::task::JoinSet;
+                    let mut join_set = JoinSet::new();
+                    let max_concurrent = 32;
+                    for subnet_ip in net.hosts() {
+                        if subnet_ip == ip {
+                            continue;
                         }
-
-                        while join_set.join_next().await.is_some() {}
+                        let socket = SocketAddr::new(subnet_ip.into(), port);
+                        let db = db.clone();
+                        let config = Arc::clone(&config);
+                        let timeout_duration = timeout_duration;
+                        join_set.spawn(handle_ip(socket, db, timeout_duration, config, false));
+                        if join_set.len() >= max_concurrent {
+                            let _ = join_set.join_next().await;
+                        }
                     }
+
+                    while join_set.join_next().await.is_some() {}
                 }
             }
-            _ => {}
         }
     })
 }
@@ -774,7 +787,7 @@ pub fn name_to_uuid(username: &str) -> String {
 async fn start_scanning_workers(
     thread_count: usize,
     db: Arc<Mutex<Client>>,
-    blacklist: Vec<BlacklistEntry>,
+    blacklist: Blacklist,
     config: Arc<Config>,
     rounds: u8,
     seed: u64,
@@ -835,11 +848,7 @@ async fn start_scanning_workers(
     }
 }
 
-async fn start_rescanner(
-    db: Arc<Mutex<Client>>,
-    blacklist: Vec<BlacklistEntry>,
-    config: Arc<Config>,
-) {
+async fn start_rescanner(db: Arc<Mutex<Client>>, blacklist: Blacklist, config: Arc<Config>) {
     if config.worker_recheck != 0 {
         let db = Arc::clone(&db);
         let blacklist = blacklist.clone();
@@ -880,7 +889,7 @@ async fn start_rescanner(
                 };
                 let chunk_size = ips_ports.len().div_ceil(config.worker_recheck as usize);
                 let mut handles = Vec::new();
-                for (_i, chunk) in ips_ports.chunks(chunk_size).enumerate() {
+                for chunk in ips_ports.chunks(chunk_size) {
                     let db = Arc::clone(&db);
                     let blacklist = blacklist.clone();
                     let config = Arc::clone(&config);
@@ -888,7 +897,7 @@ async fn start_rescanner(
                     let timeout_duration = Duration::from_millis(config.timeout_ms);
                     handles.push(tokio::spawn(async move {
                         for (ip, port) in &chunk {
-                            if ip_in_blacklist(&ip, &blacklist) {
+                            if ip_in_blacklist(ip, &blacklist) {
                                 continue;
                             }
                             let socket = SocketAddr::new((*ip).into(), *port);
