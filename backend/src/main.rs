@@ -137,7 +137,6 @@ fn handle_ip(
                 let len = match read_var_int_from_stream(&mut stream).await {
                     Ok(l) => l,
                     Err(_) => {
-                        tracing::info!("{}:{} no response", ip, port);
                         return;
                     }
                 };
@@ -163,7 +162,6 @@ fn handle_ip(
                 if let Some(resp) = response {
                     tracing::debug!("Got response for {}:{}", ip, port);
                     save_json(&addr.to_string(), &resp, &client).await;
-                    tracing::info!("Active server found: {}:{} | response", ip, port);
                     drop(client);
 
                     if config.enable_isp_scan && do_isp_scan {
@@ -392,6 +390,7 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
     };
 
     let (server_id, old_players_opt);
+    let mut is_new_server = false;
     if let Some(row) = existing {
         let old_players: Option<Players> = row.get::<_, Option<Players>>("players");
         let updated_row = client
@@ -467,6 +466,7 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
             Ok(row) => {
                 server_id = row.get::<_, i32>("id");
                 old_players_opt = None;
+                is_new_server = true;
                 tracing::info!("New server added: {} (id={})", addr, server_id);
             }
             Err(e) => {
@@ -475,6 +475,10 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
             }
         }
         save_player_joins(&players, server_id, client).await;
+    }
+
+    if is_new_server {
+        tracing::info!("Active server found: {}", addr);
     }
 
     if let Some(old_players) = old_players_opt {
@@ -842,7 +846,6 @@ async fn start_rescanner(
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             loop {
-                tracing::info!("[rescanner] Starting rescanner cycle");
                 let ips_ports: Vec<(Ipv4Addr, u16)> = {
                     let db_guard = db.lock().await;
                     let rows = db_guard.query("SELECT ip FROM servers", &[]).await;
