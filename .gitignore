@@ -1,3 +1,3 @@
 /api/target
-/backend/target
-/backend/config.toml
+/backend/scanner/target
+/backend/verifier/target

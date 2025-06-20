@@ -7,6 +7,7 @@ use std::{
 };
 
 use deadpool_postgres::{Manager, Pool};
+use futures::{stream, StreamExt};
 use ipnet::Ipv4Net;
 use postgres_types::{FromSql, ToSql};
 use rand::random;
@@ -16,8 +17,6 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::Semaphore,
-    time::timeout,
 };
 use tokio_postgres::NoTls;
 use tracing::{error, info};
@@ -25,9 +24,6 @@ use tracing::{error, info};
 mod string;
 mod u16;
 mod varint;
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
-use pin_utils::pin_mut;
 use string::read_string;
 use varint::{read_var_int, read_var_int_from_stream};
 
@@ -36,11 +32,12 @@ struct Config {
     blacklist_file: String,
     worker_count: usize,
     timeout_ms: u64,
-    worker_recheck: u64,
     db_url: String,
     enable_isp_scan: bool,
     isp_scan_subnet: u8,
     extended_port_scan: bool,
+    batch_size: usize,
+    concurrency_per_worker: usize,
 }
 
 #[derive(Clone, Default)]
@@ -300,6 +297,7 @@ async fn start_scanning_workers(
             let total_ips = u64::from(u32::MAX) + 1;
             let chunk_size = total_ips / thread_count as u64;
             let mut handles = Vec::with_capacity(thread_count);
+            
             for t in 0..thread_count {
                 let pool = pool.clone();
                 let blacklist = blacklist.clone();
@@ -310,29 +308,61 @@ async fn start_scanning_workers(
                 } else {
                     (t as u64 + 1) * chunk_size
                 };
+                
                 handles.push(tokio::spawn(async move {
                     let config = config_worker;
+                    
                     loop {
-                        for i in start..end {
-                            let ip = permute_u32(i as u32, rounds, seed);
-                            let ip_addr = Ipv4Addr::from(ip);
-                            if blacklist.contains(&ip_addr) {
-                                continue;
-                            }
-                            let socket = SocketAddr::new(ip_addr.into(), 25565);
-                            let config = Arc::clone(&config);
-                            let _ = timeout(
-                                timeout_duration,
-                                handle_ip(
-                                    socket,
-                                    pool.clone(),
-                                    timeout_duration,
-                                    config,
-                                    true,
-                                    Arc::clone(&blacklist),
-                                ),
-                            )
-                            .await;
+                        let mut current = start;
+                        while current < end {
+                            let batch_end = std::cmp::min(current + config.batch_size as u64, end);
+                            let batch_range = current..batch_end;
+                            // Clone shared resources for this batch
+                            let pool = pool.clone();
+                            let config = config.clone();
+                            let blacklist = blacklist.clone();
+                            let batch_stream = stream::iter(batch_range)
+                                .map(move |i| permute_u32(i as u32, rounds, seed))
+                                .filter_map({
+                                    let blacklist = blacklist.clone();
+                                    move |ip| {
+                                        let blacklist = blacklist.clone();
+                                        async move {
+                                            let ip_addr = Ipv4Addr::from(ip);
+                                            if !blacklist.contains(&ip_addr) {
+                                                Some(ip)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    }
+                                })
+                                .map({
+                                    let pool = pool.clone();
+                                    let config_for_closure = config.clone();
+                                    let blacklist = blacklist.clone();
+                                    move |ip| {
+                                        let socket = SocketAddr::new(Ipv4Addr::from(ip).into(), 25565);
+                                        (
+                                            socket,
+                                            pool.clone(),
+                                            timeout_duration,
+                                            config_for_closure.clone(),
+                                            blacklist.clone(),
+                                        )
+                                    }
+                                });
+
+                            batch_stream
+                                .for_each_concurrent(config.concurrency_per_worker, |(socket, pool, timeout_duration, config, blacklist)| async move {
+                                    let _ = tokio::time::timeout(
+                                        timeout_duration,
+                                        handle_ip(socket, pool, timeout_duration, config, true, blacklist),
+                                    ).await;
+                                })
+                                .await;
+                            
+                            current = batch_end;
                         }
                         tracing::info!(
                             "[main scan] Finished scan cycle for chunk: {}-{}",
@@ -342,113 +372,12 @@ async fn start_scanning_workers(
                     }
                 }));
             }
+            
             for handle in handles {
-                let res = handle.await;
-                if res.is_err() {
-                    tracing::error!("Task failed: {:?}", res);
-                }
+                let _ = handle.await;
             }
         });
     }
-}
-
-async fn start_rescanner(pool: Pool, blacklist: Arc<Blacklist>, config: Arc<Config>) {
-    if config.worker_recheck != 0 {
-        let blacklist = blacklist.clone();
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(config.worker_recheck as usize));
-
-            loop {
-                let client = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("DB pool error: {}", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
-
-                let stream = match client
-                    .query_raw("SELECT ip FROM servers", &[] as &[&str])
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to fetch IPs: {}", e);
-                        continue;
-                    }
-                };
-
-                pin_mut!(stream);
-                let mut tasks = FuturesUnordered::new();
-
-                while let Some(row) = stream.next().await {
-                    let row = match row {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("Row error: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let ip_port: String = row.get(0);
-
-                    let (ip, port) = match parse_ip_port(&ip_port) {
-                        Some(pair) => pair,
-                        None => continue,
-                    };
-
-                    let blacklist_ref = Arc::clone(&blacklist);
-                    if blacklist_ref.contains(&ip) {
-                        continue;
-                    }
-
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break,
-                    };
-
-                    let task = {
-                        let pool = pool.clone();
-                        let config = Arc::clone(&config);
-                        let timeout_duration = Duration::from_millis(config.timeout_ms);
-                        let blacklist = Arc::clone(&blacklist);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-
-                            let socket = SocketAddr::new(ip.into(), port);
-                            handle_ip(
-                                socket,
-                                pool.clone(),
-                                timeout_duration,
-                                Arc::clone(&config),
-                                false,
-                                blacklist,
-                            )
-                            .await;
-                        })
-                    };
-
-                    tasks.push(task);
-                }
-
-                while tasks.next().await.is_some() {}
-
-                tracing::info!("[Rescanner] Cycle completed");
-            }
-        });
-    }
-}
-
-fn parse_ip_port(s: &str) -> Option<(Ipv4Addr, u16)> {
-    let mut parts = s.split(':');
-    let ip_str = parts.next()?;
-    let port_str = parts.next().unwrap_or("25565");
-
-    let ip = ip_str.parse().ok()?;
-    let port = port_str.parse().unwrap_or(25565);
-    Some((ip, port))
 }
 
 pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
@@ -676,7 +605,6 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
             Ok(row) => {
                 server_id = row.get::<_, i32>("id");
                 old_players_opt = old_players;
-                tracing::info!("Server rescanned: {} (id={})", addr, server_id);
             }
             Err(e) => {
                 error!("Error updating database: {}", e);
@@ -1043,80 +971,43 @@ pub fn name_to_uuid(username: &str) -> String {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let mut args = std::env::args().skip(1);
-    if let Some(arg1) = args.next() {
-        if arg1 == "--test" {
-            if let Some(ip_str) = args.next() {
-                let port = 25565u16;
-                let ip: std::net::IpAddr = match ip_str.parse() {
-                    Ok(ip) => ip,
-                    Err(_) => {
-                        eprintln!("Invalid IP address: {}", ip_str);
-                        std::process::exit(1);
-                    }
-                };
-                let socket = SocketAddr::new(ip, port);
-                let config_data = tokio::fs::read_to_string("config.toml")
-                    .await
-                    .expect("Failed to read config.toml");
-                let config: Config = toml::from_str(&config_data).expect("Invalid config format");
-                let blacklist = Arc::new(
-                    load_blacklist(&config.blacklist_file)
-                        .await
-                        .expect("Failed to load blacklist"),
-                );
-                let pg_config = config
-                    .db_url
-                    .parse::<tokio_postgres::Config>()
-                    .expect("Invalid db_url");
-                let mgr = Manager::new(pg_config, NoTls);
-                let pool = Pool::builder(mgr).max_size(16).build().unwrap();
-                let client = pool.get().await.expect("Failed to get DB client");
-                db_init(&client).await.expect("Failed to initialize DB");
-                let timeout_duration = Duration::from_millis(config.timeout_ms);
-                handle_ip(
-                    socket,
-                    pool.clone(),
-                    timeout_duration,
-                    Arc::new(config),
-                    true,
-                    Arc::clone(&blacklist),
-                )
-                .await;
-                tracing::info!("[main] handle_ip finished");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                return;
-            } else {
-                eprintln!("Usage: --test <ip>");
-                std::process::exit(1);
-            }
-        }
-    }
-
     let config_data = tokio::fs::read_to_string("config.toml")
         .await
         .expect("Failed to read config.toml");
     let config: Config = toml::from_str(&config_data).expect("Invalid config format");
+
+    // Add default values for new parameters if missing in config
+    // let batch_size = config.batch_size;
+    // let concurrency_per_worker = config.concurrency_per_worker;
+
     let blacklist = Arc::new(
         load_blacklist(&config.blacklist_file)
             .await
             .expect("Failed to load blacklist"),
     );
+
     let pg_config = config
         .db_url
         .parse::<tokio_postgres::Config>()
         .expect("Invalid db_url");
     let mgr = Manager::new(pg_config, NoTls);
-    let pool = Pool::builder(mgr).max_size(64).build().unwrap();
+
+    // Increase pool size based on concurrency needs
+    let pool_size = config.worker_count * config.concurrency_per_worker;
+    let pool = Pool::builder(mgr)
+        .max_size(pool_size)
+        .build()
+        .unwrap();
+
     let client = pool.get().await.expect("Failed to get DB client");
     db_init(&client).await.expect("Failed to initialize DB");
 
     let seed: u64 = random();
     let rounds = 6;
-
     let thread_count = config.worker_count;
     let timeout_duration = Duration::from_millis(config.timeout_ms);
     let config = Arc::new(config);
+
     start_scanning_workers(
         thread_count,
         pool.clone(),
@@ -1127,8 +1018,6 @@ async fn main() {
         timeout_duration,
     )
     .await;
-
-    start_rescanner(pool.clone(), Arc::clone(&blacklist), Arc::clone(&config)).await;
 
     tokio::signal::ctrl_c()
         .await

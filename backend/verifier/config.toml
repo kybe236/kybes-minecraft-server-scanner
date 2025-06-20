@@ -1,0 +1,5 @@
+blacklist_file = "exclude.conf"
+worker_count = 150000
+timeout_ms = 2500
+worker_recheck = 100
+db_url = "host=127.0.0.1 port=5555 user=mc_scanner password=pwd dbname=mc_scanner"

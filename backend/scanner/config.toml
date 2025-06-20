@@ -1,9 +1,9 @@
 blacklist_file = "exclude.conf"
-worker_count = 1000
-timeout_ms = 1500
-worker_recheck = 10
-recheck_resync_delay = 1000
+timeout_ms = 2500
 db_url = "host=127.0.0.1 port=5555 user=mc_scanner password=pwd dbname=mc_scanner"
 enable_isp_scan = true
 isp_scan_subnet = 24
-isp_scan_delay_ms = 100
+extended_port_scan = true
+worker_count = 1000
+batch_size = 1000
+concurrency_per_worker = 10
