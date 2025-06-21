@@ -611,6 +611,15 @@ fn handle_ip(
                     return;
                 }
             };
+            // Limit the maximum allowed packet size (e.g., 2MB)
+            const MAX_PACKET_SIZE: i32 = 2 * 1024 * 1024; // 2MB
+            if len <= 0 || len > MAX_PACKET_SIZE {
+                warn!(
+                    "{}:{} response packet too large or invalid: {} bytes",
+                    ip, port, len
+                );
+                return;
+            }
             let mut buffer = vec![0; len as usize];
             if let Err(e) = stream.read_exact(&mut buffer).await {
                 warn!("{}:{} read failed: {}", ip, port, e);
@@ -718,74 +727,107 @@ pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgr
 }
 
 async fn start_rescanner(pool: Pool, blacklist: Arc<Blacklist>, config: Arc<Config>) {
+    use futures::FutureExt;
     use futures::stream::FuturesUnordered;
+    use std::panic::AssertUnwindSafe;
     if config.worker_recheck != 0 {
         let blacklist = blacklist.clone();
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            loop {
-                let client = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("DB pool error: {}", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
-                let rows = match client.query("SELECT ip FROM servers", &[]).await {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        error!("Failed to fetch IPs: {}", e);
-                        continue;
-                    }
-                };
-
-                let mut tasks = FuturesUnordered::new();
-                let semaphore =
-                    Arc::new(tokio::sync::Semaphore::new(config.worker_recheck as usize));
-
-                for row in rows {
-                    let ip_port: String = row.get(0);
-                    let (ip, port) = match parse_ip_port(&ip_port) {
-                        Some(pair) => pair,
-                        None => continue,
-                    };
-                    let blacklist_ref = Arc::clone(&blacklist);
-                    if blacklist_ref.contains(&ip) {
-                        continue;
-                    }
-
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break,
+            let result = AssertUnwindSafe(async move {
+                loop {
+                    info!("[Rescanner] Starting new cycle");
+                    let client =
+                        match tokio::time::timeout(Duration::from_secs(10), pool.get()).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
+                                error!("DB pool error: {}", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Err(_) => {
+                                error!("DB pool.get() timed out after 10s");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+                    let rows = match client.query("SELECT ip FROM servers", &[]).await {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            error!("Failed to fetch IPs: {}", e);
+                            continue;
+                        }
                     };
 
-                    let task = {
-                        let pool = pool.clone();
-                        let config = Arc::clone(&config);
-                        let timeout_duration = Duration::from_millis(config.timeout_ms);
-                        let blacklist = Arc::clone(&blacklist);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let socket = SocketAddr::new(ip.into(), port);
-                            handle_ip(
-                                socket,
-                                pool.clone(),
-                                timeout_duration,
-                                Arc::clone(&config),
-                                false,
-                                blacklist,
-                            )
-                            .await;
-                        })
-                    };
-                    tasks.push(task);
+                    let mut tasks = FuturesUnordered::new();
+                    let semaphore =
+                        Arc::new(tokio::sync::Semaphore::new(config.worker_recheck as usize));
+
+                    for row in rows {
+                        let ip_port: String = row.get(0);
+                        let (ip, port) = match parse_ip_port(&ip_port) {
+                            Some(pair) => pair,
+                            None => continue,
+                        };
+                        let blacklist_ref = Arc::clone(&blacklist);
+                        if blacklist_ref.contains(&ip) {
+                            continue;
+                        }
+
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+
+                        let task = {
+                            let pool = pool.clone();
+                            let config = Arc::clone(&config);
+                            let timeout_duration = Duration::from_millis(config.timeout_ms);
+                            let blacklist = Arc::clone(&blacklist);
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let socket = SocketAddr::new(ip.into(), port);
+                                // Apply a global timeout to the whole handle_ip future (double the per-connection timeout for safety)
+                                let global_timeout = timeout_duration * 2;
+                                let res = tokio::time::timeout(
+                                    global_timeout,
+                                    handle_ip(
+                                        socket,
+                                        pool.clone(),
+                                        timeout_duration,
+                                        Arc::clone(&config),
+                                        false,
+                                        blacklist,
+                                    ),
+                                )
+                                .await;
+                                if res.is_err() {
+                                    warn!("Global timeout for {}:{}", ip, port);
+                                }
+                            })
+                        };
+                        tasks.push(task);
+                    }
+
+                    // Replace redundant pattern matching with is_some()
+                    while let Some(res) = tasks.next().await {
+                        if let Err(e) = res {
+                            error!("Rescanner task panicked: {:?}", e);
+                        }
+                    }
+                    info!("[Rescanner] Cycle completed, sleeping 60s");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    info!("[Rescanner] Woke up from sleep");
                 }
+            })
+            .catch_unwind()
+            .await;
 
-                // Replace redundant pattern matching with is_some()
-                while tasks.next().await.is_some() {}
-                info!("[Rescanner] Cycle completed");
-                tokio::time::sleep(Duration::from_secs(60)).await;
+            if result.is_err() {
+                error!(
+                    "[Rescanner] Panic occurred, rescanner stopped: {:?}",
+                    result
+                );
             }
         });
     }

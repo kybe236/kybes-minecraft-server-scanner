@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "kybes-client",
+  "version": "${version}",
+  "name": "kybes-client",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "de.kybe.kybesclient"
+    ]
+  },
+  "mixins": [
+    "kybes-client.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}

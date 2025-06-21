@@ -7,7 +7,7 @@ use std::{
 };
 
 use deadpool_postgres::{Manager, Pool};
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use ipnet::Ipv4Net;
 use postgres_types::{FromSql, ToSql};
 use rand::random;
@@ -293,90 +293,90 @@ async fn start_scanning_workers(
     } else {
         let blacklist = blacklist.clone();
         let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            let total_ips = u64::from(u32::MAX) + 1;
-            let chunk_size = total_ips / thread_count as u64;
-            let mut handles = Vec::with_capacity(thread_count);
-            
-            for t in 0..thread_count {
-                let pool = pool.clone();
-                let blacklist = blacklist.clone();
-                let config_worker = Arc::clone(&config);
-                let start = t as u64 * chunk_size;
-                let end = if t == thread_count - 1 {
-                    total_ips
-                } else {
-                    (t as u64 + 1) * chunk_size
-                };
-                
-                handles.push(tokio::spawn(async move {
-                    let config = config_worker;
-                    
-                    loop {
-                        let mut current = start;
-                        while current < end {
-                            let batch_end = std::cmp::min(current + config.batch_size as u64, end);
-                            let batch_range = current..batch_end;
-                            // Clone shared resources for this batch
-                            let pool = pool.clone();
-                            let config = config.clone();
+        let total_ips = u64::from(u32::MAX) + 1;
+        let chunk_size = total_ips / thread_count as u64;
+        let mut handles = Vec::with_capacity(thread_count);
+        for t in 0..thread_count {
+            let pool = pool.clone();
+            let blacklist = blacklist.clone();
+            let config_worker = Arc::clone(&config);
+            let start = t as u64 * chunk_size;
+            let end = if t == thread_count - 1 {
+                total_ips
+            } else {
+                (t as u64 + 1) * chunk_size
+            };
+            handles.push(tokio::spawn(async move {
+                let config = config_worker;
+                let mut current = start;
+                while current < end {
+                    let batch_end = std::cmp::min(current + config.batch_size as u64, end);
+                    let batch_range = current..batch_end;
+                    let pool = pool.clone();
+                    let config = config.clone();
+                    let blacklist = blacklist.clone();
+                    let batch_stream = stream::iter(batch_range)
+                        .map(move |i| permute_u32(i as u32, rounds, seed))
+                        .filter_map({
                             let blacklist = blacklist.clone();
-                            let batch_stream = stream::iter(batch_range)
-                                .map(move |i| permute_u32(i as u32, rounds, seed))
-                                .filter_map({
-                                    let blacklist = blacklist.clone();
-                                    move |ip| {
-                                        let blacklist = blacklist.clone();
-                                        async move {
-                                            let ip_addr = Ipv4Addr::from(ip);
-                                            if !blacklist.contains(&ip_addr) {
-                                                Some(ip)
-                                            } else {
-                                                None
-                                            }
-                                        }
+                            move |ip| {
+                                let blacklist = blacklist.clone();
+                                async move {
+                                    let ip_addr = Ipv4Addr::from(ip);
+                                    if !blacklist.contains(&ip_addr) {
+                                        Some(ip)
+                                    } else {
+                                        None
                                     }
-                                })
-                                .map({
-                                    let pool = pool.clone();
-                                    let config_for_closure = config.clone();
-                                    let blacklist = blacklist.clone();
-                                    move |ip| {
-                                        let socket = SocketAddr::new(Ipv4Addr::from(ip).into(), 25565);
-                                        (
-                                            socket,
-                                            pool.clone(),
-                                            timeout_duration,
-                                            config_for_closure.clone(),
-                                            blacklist.clone(),
-                                        )
-                                    }
-                                });
-
-                            batch_stream
-                                .for_each_concurrent(config.concurrency_per_worker, |(socket, pool, timeout_duration, config, blacklist)| async move {
-                                    let _ = tokio::time::timeout(
+                                }
+                            }
+                        })
+                        .map({
+                            let pool = pool.clone();
+                            let config_for_closure = config.clone();
+                            let blacklist = blacklist.clone();
+                            move |ip| {
+                                let socket = SocketAddr::new(Ipv4Addr::from(ip).into(), 25565);
+                                (
+                                    socket,
+                                    pool.clone(),
+                                    timeout_duration,
+                                    config_for_closure.clone(),
+                                    blacklist.clone(),
+                                )
+                            }
+                        });
+                    batch_stream
+                        .for_each_concurrent(
+                            config.concurrency_per_worker,
+                            |(socket, pool, timeout_duration, config, blacklist)| async move {
+                                let _ = tokio::time::timeout(
+                                    timeout_duration,
+                                    handle_ip(
+                                        socket,
+                                        pool,
                                         timeout_duration,
-                                        handle_ip(socket, pool, timeout_duration, config, true, blacklist),
-                                    ).await;
-                                })
+                                        config,
+                                        true,
+                                        blacklist,
+                                    ),
+                                )
                                 .await;
-                            
-                            current = batch_end;
-                        }
-                        tracing::info!(
-                            "[main scan] Finished scan cycle for chunk: {}-{}",
-                            start,
-                            end
-                        );
-                    }
-                }));
-            }
-            
-            for handle in handles {
-                let _ = handle.await;
-            }
-        });
+                            },
+                        )
+                        .await;
+                    current = batch_end;
+                }
+                tracing::info!(
+                    "[main scan] Finished scan cycle for chunk: {}-{}",
+                    start,
+                    end
+                );
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 }
 
@@ -976,10 +976,6 @@ async fn main() {
         .expect("Failed to read config.toml");
     let config: Config = toml::from_str(&config_data).expect("Invalid config format");
 
-    // Add default values for new parameters if missing in config
-    // let batch_size = config.batch_size;
-    // let concurrency_per_worker = config.concurrency_per_worker;
-
     let blacklist = Arc::new(
         load_blacklist(&config.blacklist_file)
             .await
@@ -994,10 +990,7 @@ async fn main() {
 
     // Increase pool size based on concurrency needs
     let pool_size = config.worker_count * config.concurrency_per_worker;
-    let pool = Pool::builder(mgr)
-        .max_size(pool_size)
-        .build()
-        .unwrap();
+    let pool = Pool::builder(mgr).max_size(pool_size).build().unwrap();
 
     let client = pool.get().await.expect("Failed to get DB client");
     db_init(&client).await.expect("Failed to initialize DB");
@@ -1018,8 +1011,4 @@ async fn main() {
         timeout_duration,
     )
     .await;
-
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl_c");
 }
