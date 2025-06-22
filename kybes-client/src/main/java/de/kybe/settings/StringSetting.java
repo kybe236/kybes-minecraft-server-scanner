@@ -1,10 +1,9 @@
 package de.kybe.settings;
 
 import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
-public class StringSetting extends Setting<String>{
+public class StringSetting extends Setting<String> {
   private String value;
 
   public StringSetting(String name, String defaultValue) {
@@ -34,6 +33,15 @@ public class StringSetting extends Setting<String>{
     loadSubSettings(json);
   }
 
-  public String getValue() { return value; }
-  public void setValue(String value) { this.value = value; }
+  public String getValue() {
+    return value;
+  }
+
+  @Override
+  public void setValue(String value) {
+    String old = this.value;
+    this.value = value;
+    notifyChange(old, value);
+  }
+
 }

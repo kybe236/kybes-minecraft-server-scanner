@@ -6,8 +6,8 @@ import de.kybe.module.ToggleableModule;
 import de.kybe.settings.NumberSetting;
 import de.kybe.settings.Setting;
 import de.kybe.settings.StringSetting;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -15,8 +15,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ConfigTest {
   private static final Path TEST_PATH = Path.of("test_kybe.conf");

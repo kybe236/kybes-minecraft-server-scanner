@@ -4,8 +4,9 @@
   "package": "de.kybe.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "KeyboardHandlerMixin",
     "MinecraftMixin",
-    "SharedConstantsMixin"
+    "OnlineServerEntryMixin"
   ],
   "injectors": {
     "defaultRequire": 1

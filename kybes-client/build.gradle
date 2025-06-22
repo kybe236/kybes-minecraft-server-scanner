@@ -23,6 +23,7 @@ dependencies {
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    implementation 'org.postgresql:postgresql:42.6.0'
 }
 
 processResources {

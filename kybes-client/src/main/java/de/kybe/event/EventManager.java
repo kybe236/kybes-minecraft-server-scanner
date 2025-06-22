@@ -12,7 +12,6 @@ public class EventManager {
   public static void registerModule(Object module) {
     for (Method method : module.getClass().getDeclaredMethods()) {
       if (method.isAnnotationPresent(KybeEvents.class)) {
-        // Validate method signature: one param extending Event
         Class<?>[] params = method.getParameterTypes();
         if (params.length == 1 && Event.class.isAssignableFrom(params[0])) {
           subscribers.add(new Subscriber(module, method));
@@ -21,6 +20,7 @@ public class EventManager {
     }
   }
 
+  @SuppressWarnings("CallToPrintStackTrace")
   public static void call(Event event) {
     for (Subscriber sub : subscribers) {
       Method method = sub.method;
@@ -30,17 +30,12 @@ public class EventManager {
           method.invoke(sub.instance, event);
         } catch (Exception e) {
           e.printStackTrace();
+          System.err.println("Failed to invoke event handler: " + method.getName() + " in " + sub.instance.getClass().getName());
         }
       }
     }
   }
 
-  private static class Subscriber {
-    final Object instance;
-    final Method method;
-    Subscriber(Object instance, Method method) {
-      this.instance = instance;
-      this.method = method;
-    }
+  private record Subscriber(Object instance, Method method) {
   }
 }

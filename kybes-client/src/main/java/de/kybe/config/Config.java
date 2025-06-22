@@ -16,6 +16,10 @@ import java.nio.file.Path;
 public class Config {
   private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+  private static boolean autoSave = true;
+  private static int autoSaveIntervalTicks = 5;
+  private static int tickCounter = 0;
+
   public static void save() {
     save(Minecraft.getInstance().gameDirectory.toPath().resolve("kybe.conf"));
   }
@@ -24,6 +28,24 @@ public class Config {
     load(Minecraft.getInstance().gameDirectory.toPath().resolve("kybe.conf"));
   }
 
+  public static void setAutoSave(boolean value) {
+    autoSave = value;
+  }
+
+  public static void setAutoSaveInterval(int ticks) {
+    autoSaveIntervalTicks = Math.max(1, ticks);
+  }
+
+  public static void tick() {
+    if (!autoSave) return;
+
+    if (++tickCounter >= autoSaveIntervalTicks) {
+      tickCounter = 0;
+      save();
+    }
+  }
+
+  @SuppressWarnings("CallToPrintStackTrace")
   public static void save(Path path) {
     JsonArray moduleArray = new JsonArray();
 
@@ -51,6 +73,7 @@ public class Config {
     }
   }
 
+  @SuppressWarnings("CallToPrintStackTrace")
   public static void load(Path path) {
     if (!Files.exists(path)) return;
 

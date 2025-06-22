@@ -10,7 +10,7 @@
   "environment": "client",
   "entrypoints": {
     "main": [
-      "de.kybe.kybesclient"
+      "de.kybe.KybesClient"
     ]
   },
   "mixins": [

@@ -1,5 +1,7 @@
 package de.kybe.module;
 
+import de.kybe.event.EventManager;
+
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -9,6 +11,7 @@ public class ModuleManager {
 
   public static void register(Module module) {
     modules.put(module.getName(), module);
+    EventManager.registerModule(module);
   }
 
   public static void clearModules() {
