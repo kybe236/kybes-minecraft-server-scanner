@@ -22,6 +22,15 @@ public class ColorSetting extends Setting<Integer> {
     notifyChange(old, value);
   }
 
+  // New method to accept hex string directly
+  public void setValue(String hex) {
+    setHex(hex);
+  }
+
+  public String getHex() {
+    return String.format("#%08X", color);
+  }
+
   // Your existing hex parser that adds alpha if missing
   public void setHex(String hex) {
     if (hex == null) return;
@@ -32,16 +41,8 @@ public class ColorSetting extends Setting<Integer> {
       if (hex.length() != 8) return;
       int parsed = (int) Long.parseLong(hex, 16);
       setValue(parsed);
-    } catch (NumberFormatException ignored) {}
-  }
-
-  // New method to accept hex string directly
-  public void setValue(String hex) {
-    setHex(hex);
-  }
-
-  public String getHex() {
-    return String.format("#%08X", color);
+    } catch (NumberFormatException ignored) {
+    }
   }
 
   @SuppressWarnings("unused")

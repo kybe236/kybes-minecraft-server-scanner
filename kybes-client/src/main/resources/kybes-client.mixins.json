@@ -4,11 +4,16 @@
   "package": "de.kybe.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "IMixinMinecraft",
     "KeyboardHandlerMixin",
     "MinecraftMixin",
     "OnlineServerEntryMixin"
   ],
   "injectors": {
     "defaultRequire": 1
-  }
+  },
+  "mixins": [
+    "ConnectionMixin",
+    "IMixinMovePlayerPacket"
+  ]
 }

@@ -32,7 +32,7 @@ public class ConfigTest {
     TestToggleableModule testModule = new TestToggleableModule("TestModule");
     testModule.setToggled(true);
 
-    NumberSetting<Integer> speed = new NumberSetting<>("Speed", 10);
+    NumberSetting<Integer> speed = new NumberSetting<>("SpeedModule", 10);
     StringSetting mode = new StringSetting("Mode", "Fast");
     testModule.getSettings().add(speed);
     testModule.getSettings().add(mode);
@@ -48,7 +48,7 @@ public class ConfigTest {
     Config.load(TEST_PATH);
 
     assertTrue(testModule.isToggled(), "Module toggled state should be true after load");
-    assertEquals(10, speed.getValue(), "Speed setting should be 10 after load");
+    assertEquals(10, speed.getValue(), "SpeedModule setting should be 10 after load");
     assertEquals("Fast", mode.getValue(), "Mode setting should be 'Fast' after load");
   }
 

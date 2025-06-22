@@ -1,8 +1,11 @@
 package de.kybe.module.modules;
 
+import de.kybe.module.ModuleManager;
 import de.kybe.module.ToggleableModule;
+import de.kybe.settings.BooleanSetting;
 import de.kybe.settings.NullSetting;
 import de.kybe.settings.StringSetting;
+import it.unimi.dsi.fastutil.booleans.BooleanSet;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.ServerList;
 
@@ -21,6 +24,14 @@ public class Scanner extends ToggleableModule {
   private final StringSetting dbuser = new StringSetting("Database User", "mc_scanner");
   private final StringSetting dbpassword = new StringSetting("Database Password", "");
   private final StringSetting query = new StringSetting("Query", "SELECT ip FROM servers LIMIT 10");
+  public final BooleanSetting clearServers = (BooleanSetting) new BooleanSetting("Clear Servers", true).onChange((aBoolean, aBoolean2) -> {
+    if (aBoolean2) {
+      ServerList serverList = new ServerList(mc);
+      serverList.save();
+      System.out.println("Cleared server list.");
+      Scanner.INSTANCE.clearServers.setValue(false);
+    }
+  });
 
   public Scanner() {
     super("Scanner Accessor Module");
@@ -36,7 +47,8 @@ public class Scanner extends ToggleableModule {
       ndburl,
       ndbuser,
       ndbpassword,
-      query
+      query,
+      clearServers
     );
 
     INSTANCE = this;
