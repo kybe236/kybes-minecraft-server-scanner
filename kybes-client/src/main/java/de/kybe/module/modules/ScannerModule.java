@@ -1,11 +1,9 @@
 package de.kybe.module.modules;
 
-import de.kybe.module.ModuleManager;
 import de.kybe.module.ToggleableModule;
 import de.kybe.settings.BooleanSetting;
 import de.kybe.settings.NullSetting;
 import de.kybe.settings.StringSetting;
-import it.unimi.dsi.fastutil.booleans.BooleanSet;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.ServerList;
 
@@ -17,8 +15,8 @@ import java.util.Set;
 
 import static de.kybe.Constants.mc;
 
-public class Scanner extends ToggleableModule {
-  public static Scanner INSTANCE;
+public class ScannerModule extends ToggleableModule {
+  public static ScannerModule INSTANCE;
 
   private final StringSetting dburl = new StringSetting("Database URL", "jdbc:postgresql://localhost:5555/mc_scanner");
   private final StringSetting dbuser = new StringSetting("Database User", "mc_scanner");
@@ -29,12 +27,12 @@ public class Scanner extends ToggleableModule {
       ServerList serverList = new ServerList(mc);
       serverList.save();
       System.out.println("Cleared server list.");
-      Scanner.INSTANCE.clearServers.setValue(false);
+      ScannerModule.INSTANCE.clearServers.setValue(false);
     }
   });
 
-  public Scanner() {
-    super("Scanner Accessor Module");
+  public ScannerModule() {
+    super("ScannerModule Accessor Module");
 
     NullSetting ndburl = new NullSetting("Database URL");
     ndburl.addSubSetting(dburl);
@@ -58,7 +56,7 @@ public class Scanner extends ToggleableModule {
   protected void onToggled(boolean toggled) {
     if (!toggled) return;
 
-    System.out.println("Scanner module toggled on. Query: " + query.getValue());
+    System.out.println("ScannerModule module toggled on. Query: " + query.getValue());
 
     String url = dburl.getValue();
     String user = dbuser.getValue();
@@ -68,6 +66,13 @@ public class Scanner extends ToggleableModule {
     ServerList serverList = new ServerList(mc);
     serverList.load();
 
+
+    try {
+      Class.forName("org.postgresql.Driver");
+    } catch (Exception e) {
+      e.printStackTrace();
+      return;
+    }
     try (Connection conn = DriverManager.getConnection(url, user, password);
          PreparedStatement stat = conn.prepareStatement(sql);
          ResultSet rs = stat.executeQuery()) {

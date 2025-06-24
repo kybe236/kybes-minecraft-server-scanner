@@ -3,6 +3,9 @@ package de.kybe.module.modules;
 import de.kybe.module.ToggleableModule;
 import de.kybe.screens.GUI;
 import de.kybe.settings.ColorSetting;
+import net.minecraft.client.gui.screens.ChatScreen;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 
 import static de.kybe.Constants.mc;
 
@@ -24,6 +27,15 @@ public class GUIModule extends ToggleableModule {
   @Override
   protected void onToggled(boolean toggled) {
     if (!toggled) return;
+
+    Screen screen = mc.screen;
+    if (screen instanceof InventoryScreen) return;
+    if (screen instanceof ChatScreen) return;
+    if (screen instanceof GUI) {
+      mc.setScreen(null);
+      return;
+    }
+
     mc.setScreen(new GUI());
     this.setToggled(false);
   }

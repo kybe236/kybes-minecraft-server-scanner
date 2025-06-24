@@ -22,6 +22,13 @@ public class ModuleManager {
     return modules.get(name);
   }
 
+  public static Module getByNameCaseInsensitive(String name) {
+    return modules.values().stream()
+        .filter(module -> module.getName().equalsIgnoreCase(name))
+        .findFirst()
+        .orElse(null);
+  }
+
   public static Collection<Module> getAll() {
     return modules.values();
   }

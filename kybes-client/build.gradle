@@ -1,6 +1,7 @@
 plugins {
     id 'fabric-loom' version '1.10-SNAPSHOT'
     id 'maven-publish'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 
 version = project.mod_version
@@ -23,7 +24,7 @@ dependencies {
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
-    implementation 'org.postgresql:postgresql:42.6.0'
+    shadow 'org.postgresql:postgresql:42.7.7'
 }
 
 processResources {
@@ -89,3 +90,12 @@ publishing {
         // retrieving dependencies.
     }
 }
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+tasks.register('outputJar', ShadowJar) {
+    archiveClassifier.set("all")
+    from remapJar
+    configurations = [project.configurations.shadow]
+}
+tasks.build.dependsOn(outputJar)

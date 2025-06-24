@@ -1,6 +1,6 @@
 package de.kybe.screens;
 
-import de.kybe.module.modules.Scanner;
+import de.kybe.module.modules.ScannerModule;
 import de.kybe.utils.CrackedUtils;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.ObjectSelectionList;
@@ -26,7 +26,7 @@ public class ServerPlayerListScreen extends Screen {
   protected void init() {
     super.init();
 
-    List<String> players = Scanner.INSTANCE.getPlayers(serverIp);
+    List<String> players = ScannerModule.INSTANCE.getPlayers(serverIp);
     players.sort(String::compareToIgnoreCase);
 
     int top = 80;

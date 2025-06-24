@@ -33,6 +33,11 @@ public class ToggleableModule extends Module {
     onToggled(toggled);
   }
 
+  public void toggle() {
+    setToggled(!isToggled());
+    onToggled(isToggled());
+  }
+
   protected void onToggled(boolean toggled) {
 
   }
