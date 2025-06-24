@@ -1,376 +1,134 @@
-use std::{
-    collections::HashSet,
-    net::{Ipv4Addr, SocketAddr},
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
-
-use deadpool_postgres::{Manager, Pool};
-use ipnet::Ipv4Net;
-use postgres_types::{FromSql, ToSql};
-use serde::Deserialize;
-use serde_json::{self, Value};
-use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    process::Command,
-};
-use tokio_postgres::NoTls;
-use tracing::{error, info};
-
 mod string;
 mod u16;
 mod varint;
-use string::read_string;
-use varint::{read_var_int, read_var_int_from_stream};
 
-#[derive(Deserialize)]
+use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod, Runtime};
+use postgres_types::{FromSql, ToSql};
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::net::Ipv4Addr;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::net::unix::SocketAddr;
+use tokio::sync::{Mutex, mpsc};
+use tokio_postgres::NoTls;
+use tracing::error;
+
+use crate::string::read_string;
+use crate::varint::{read_var_int, read_var_int_from_stream};
+
+#[derive(Debug, Deserialize)]
 struct Config {
-    blacklist_file: String,
-    worker_count: usize,
+    ip_range: String,
+    masscan_rate: u32,
+    isp_scan_enabled: bool,
+    mc_checker_threads: usize,
+    database_url: String,
     timeout_ms: u64,
-    db_url: String,
-    enable_isp_scan: bool,
-    isp_scan_subnet: u8,
-    extended_port_scan: bool,
-    concurrency_per_worker: usize,
-    scan_rate: u32,
+    blacklist_file: String,
+    masscan_use_sudo: bool, // Run masscan with sudo if true
 }
 
-#[derive(Clone, Default)]
-struct Blacklist {
-    cidrs: Vec<Ipv4Net>,
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+struct CompressedTarget {
+    ip: u32,
+    port: u16,
 }
 
-impl Blacklist {
-    fn contains(&self, ip: &Ipv4Addr) -> bool {
-        self.cidrs.iter().any(|cidr| cidr.contains(ip))
-    }
+fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
+    u32::from(ip)
 }
 
-fn range_to_cidrs(start: Ipv4Addr, end: Ipv4Addr) -> Vec<Ipv4Net> {
-    let mut cidrs = Vec::new();
-    let mut current = u32::from(start);
-    let end = u32::from(end);
-    while current <= end {
-        let max_size = (!current).wrapping_add(1).trailing_zeros();
-        let remaining = (end - current + 1).trailing_zeros();
-        let prefix = 32 - max_size.min(remaining);
-        let net = Ipv4Net::new(Ipv4Addr::from(current), prefix as u8).unwrap();
-        cidrs.push(net);
-        let hosts = 1u32 << (32 - prefix);
-        current = current.saturating_add(hosts);
-    }
-    cidrs
+fn u32_to_ipv4_string(ip: u32) -> String {
+    Ipv4Addr::from(ip).to_string()
 }
 
-fn parse_ip_range(range_str: &str) -> Option<(Ipv4Addr, Ipv4Addr)> {
-    let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let start = parts[0].parse::<Ipv4Addr>().ok()?;
-    let end = parts[1].parse::<Ipv4Addr>().ok()?;
-    if start <= end {
-        Some((start, end))
-    } else {
-        Some((end, start))
-    }
-}
-
-async fn load_blacklist(path: &str) -> Result<Blacklist, std::io::Error> {
-    let file = File::open(path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut cidrs = Vec::new();
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Ok(ip) = line.parse::<Ipv4Addr>() {
-            cidrs.push(Ipv4Net::new(ip, 32).unwrap());
-            continue;
-        }
-        if let Ok(cidr) = line.parse::<Ipv4Net>() {
-            cidrs.push(cidr);
-            continue;
-        }
-        if let Some((start, end)) = parse_ip_range(line) {
-            cidrs.extend(range_to_cidrs(start, end));
-            continue;
-        }
-        eprintln!("[WARN] Ignoring invalid blacklist line: {}", line);
-    }
-    Ok(Blacklist { cidrs })
-}
-
-async fn extended_port_scan(
-    ip: Ipv4Addr,
-    pool: Pool,
-    timeout_duration: Duration,
-    _config: Arc<Config>,
-    blacklist: Arc<Blacklist>,
-) {
-    let mut found = false;
-    for port in 25500..=25700 {
-        if blacklist.contains(&ip) {
-            break;
-        }
-        let socket = SocketAddr::new(ip.into(), port);
-        if try_port(socket, pool.clone(), timeout_duration, _config.clone()).await {
-            found = true;
-            break;
-        }
-    }
-    if found {
-        for port in 1024..=65535 {
-            if blacklist.contains(&ip) {
-                break;
-            }
-            let socket = SocketAddr::new(ip.into(), port);
-            let _ = try_port(socket, pool.clone(), timeout_duration, _config.clone()).await;
-        }
-    }
-}
-
-async fn try_port(
-    socket: SocketAddr,
-    pool: Pool,
-    timeout_duration: Duration,
-    _config: Arc<Config>,
-) -> bool {
-    let ip = match socket.ip() {
-        std::net::IpAddr::V4(ip) => ip,
-        _ => return false,
-    };
-    let port = socket.port();
-    if let Ok(Ok(mut stream)) =
-        tokio::time::timeout(timeout_duration, TcpStream::connect(socket)).await
-    {
-        let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
-        if stream.write_all(&handshake).await.is_err() {
-            return false;
-        }
-        let status = create_status_request().await;
-        if stream.write_all(&status).await.is_err() {
-            return false;
-        }
-        let len = match read_var_int_from_stream(&mut stream).await {
-            Ok(l) => l,
-            Err(_) => return false,
-        };
-        let mut buffer = vec![0; len as usize];
-        if stream.read_exact(&mut buffer).await.is_err() {
-            return false;
-        }
-        let mut index = 0;
-        let _ = read_var_int(&buffer, Some(&mut index));
-        let response = read_string(&buffer, &mut index).ok();
-        let client = match pool.get().await {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        if let Some(resp) = response {
-            save_json(&socket.to_string(), &resp, &client).await;
-            return true;
-        }
-    }
-    false
-}
-
-fn handle_ip(
-    addr: SocketAddr,
-    pool: Pool,
-    timeout_duration: Duration,
-    config: Arc<Config>,
-    do_isp_scan: bool,
-    blacklist: Arc<Blacklist>,
-) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async move {
-        let ip = match addr.ip() {
-            std::net::IpAddr::V4(ip) => ip,
-            _ => return,
-        };
-        let port = addr.port();
-        if let Ok(Ok(mut stream)) =
-            tokio::time::timeout(timeout_duration, TcpStream::connect(addr)).await
-        {
-            let handshake = create_handshake_packet(757, &ip.to_string(), port, 1).await;
-            if let Err(e) = stream.write_all(&handshake).await {
-                tracing::warn!("{}:{} handshake failed: {}", ip, port, e);
-                return;
-            }
-            let status = create_status_request().await;
-            if let Err(e) = stream.write_all(&status).await {
-                tracing::warn!("{}:{} status request failed: {}", ip, port, e);
-                return;
-            }
-            let len = match read_var_int_from_stream(&mut stream).await {
-                Ok(l) => l,
-                Err(_) => {
-                    return;
-                }
-            };
-            let mut buffer = vec![0; len as usize];
-            if let Err(e) = stream.read_exact(&mut buffer).await {
-                tracing::warn!("{}:{} read failed: {}", ip, port, e);
-                return;
-            }
-            let mut index = 0;
-            let _ = read_var_int(&buffer, Some(&mut index));
-            let response = read_string(&buffer, &mut index).ok();
-            let client = match pool.get().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("DB pool error: {}", e);
-                    return;
-                }
-            };
-            if let Some(resp) = response {
-                tracing::debug!("Got response for {}:{}", ip, port);
-                save_json(&addr.to_string(), &resp, &client).await;
-                if config.enable_isp_scan && do_isp_scan {
-                    info!("{}:{} ISP scan enabled, scanning subnet", ip, port);
-                    let prefix = config.isp_scan_subnet;
-                    let net = ipnet::Ipv4Net::new(ip, prefix)
-                        .unwrap_or_else(|_| ipnet::Ipv4Net::new(ip, 24).unwrap());
-                    use tokio::task::JoinSet;
-                    let mut join_set = JoinSet::new();
-                    let max_concurrent = 32;
-                    for subnet_ip in net.hosts() {
-                        if subnet_ip == ip {
-                            continue;
-                        }
-                        let pool = pool.clone();
-                        let config = Arc::clone(&config);
-                        let timeout_duration = timeout_duration;
-                        let blacklist = Arc::clone(&blacklist);
-                        if config.extended_port_scan {
-                            join_set.spawn(extended_port_scan(
-                                subnet_ip,
-                                pool,
-                                timeout_duration,
-                                config,
-                                Arc::clone(&blacklist),
-                            ));
-                        } else {
-                            let socket = SocketAddr::new(subnet_ip.into(), port);
-                            join_set.spawn(handle_ip(
-                                socket,
-                                pool,
-                                timeout_duration,
-                                config,
-                                false,
-                                Arc::clone(&blacklist),
-                            ));
-                        }
-                        if join_set.len() >= max_concurrent {
-                            let _ = join_set.join_next().await;
+fn parse_masscan_output(stdout: impl BufRead) -> Vec<CompressedTarget> {
+    let mut results = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(l) = line {
+            if l.starts_with("Discovered open port") {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                if parts.len() >= 6 {
+                    if let Ok(port) = parts[3].split('/').next().unwrap_or("0").parse::<u16>() {
+                        if let Ok(ip) = parts[5].parse::<Ipv4Addr>() {
+                            results.push(CompressedTarget {
+                                ip: ipv4_to_u32(ip),
+                                port,
+                            });
                         }
                     }
-                    while join_set.join_next().await.is_some() {}
                 }
             }
         }
-    })
+    }
+    results
 }
 
-pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    client
-        .batch_execute(
-            r#"
-        -- Conditionally create custom types if they do not exist
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'action_type') THEN
-                CREATE TYPE action_type AS ENUM ('JOINED', 'LEFT');
-            END IF;
-        END$$;
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'player') THEN
-                CREATE TYPE player AS (
-                    name TEXT,
-                    id TEXT
-                );
-            END IF;
-        END$$;
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'version') THEN
-                CREATE TYPE version AS (
-                    name TEXT,
-                    protocol INTEGER
-                );
-            END IF;
-        END$$;
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'players') THEN
-                CREATE TYPE players AS (
-                    max INTEGER,
-                    online INTEGER,
-                    sample player[]
-                );
-            END IF;
-        END$$;
+fn run_masscan_custom(
+    ip_range: &str,
+    ports: &str,
+    rate: u32,
+    blacklist_file: &str,
+    use_sudo: bool,
+) -> Vec<CompressedTarget> {
+    let mut cmd = if use_sudo {
+        let mut c = Command::new("sudo");
+        c.arg("masscan");
+        c
+    } else {
+        Command::new("masscan")
+    };
+    cmd.arg(ip_range)
+        .arg("-p")
+        .arg(ports)
+        .arg(format!("--rate={}", rate))
+        .arg("--wait=0")
+        .arg("--excludefile")
+        .arg(blacklist_file)
+        .stdout(Stdio::piped());
 
-        -- Create servers table
-        CREATE TABLE IF NOT EXISTS servers (
-            id SERIAL PRIMARY KEY,
-            ip TEXT NOT NULL UNIQUE,
-            description TEXT,
-            raw_description JSONB,
-            players players,
-            version version,
-            favicon TEXT,
-            enforces_secure_chat BOOLEAN,
-            extra JSONB,
-            last_pinged TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
+    let output = cmd
+        .spawn()
+        .expect("failed to run masscan")
+        .stdout
+        .expect("no stdout");
+    let reader = BufReader::new(output);
+    parse_masscan_output(reader)
+}
 
-        -- Create player list table
-        CREATE TABLE IF NOT EXISTS player_list (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            uuid TEXT NOT NULL,
-            cracked BOOLEAN NOT NULL,
-            UNIQUE (uuid, name)
-        );
-
-        -- Create player actions table
-        CREATE TABLE IF NOT EXISTS player_actions (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES player_list(id),
-            server_id INTEGER NOT NULL REFERENCES servers(id),
-            action action_type NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        -- Create validator status table (for validator only)
-        CREATE TABLE IF NOT EXISTS validator_status (
-            id SERIAL PRIMARY KEY,
-            ips_validated INTEGER NOT NULL,
-            ips_active INTEGER NOT NULL,
-            ips_validated_list TEXT[] NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        -- Create scanner status table (for scanner only)
-        CREATE TABLE IF NOT EXISTS status (
-            id SERIAL PRIMARY KEY,
-            ips_scanned INTEGER NOT NULL,
-            ips_active INTEGER NOT NULL,
-            ips_active_list TEXT[] NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        -- Create index on player_list for faster lookups
-        CREATE INDEX IF NOT EXISTS idx_player_list_name_uuid ON player_list (name, uuid);
-        "#,
+async fn get_user_id(client: &tokio_postgres::Client, name: &str, uuid: &str) -> Option<i32> {
+    let row = client
+        .query_one(
+            "SELECT id FROM player_list WHERE name = $1 AND uuid = $2",
+            &[&name, &uuid],
         )
-        .await?;
+        .await
+        .ok()?;
+    let id: i32 = row.get("id");
+    Some(id)
+}
 
-    Ok(())
+pub fn name_to_uuid(username: &str) -> String {
+    let mut hash = md5::compute(format!("OfflinePlayer:{}", username)).0;
+    hash[6] = hash[6] & 0x0f | 0x30;
+    hash[8] = hash[8] & 0x3f | 0x80;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]),
+        u16::from_be_bytes([hash[4], hash[5]]),
+        u16::from_be_bytes([hash[6], hash[7]]),
+        u16::from_be_bytes([hash[8], hash[9]]),
+        u64::from_be_bytes([
+            hash[10], hash[11], hash[12], hash[13], hash[14], hash[15], 0, 0
+        ]) >> 16
+    )
 }
 
 async fn create_handshake_packet(
@@ -540,6 +298,22 @@ async fn save_json(addr: &str, json_str: &str, client: &tokio_postgres::Client) 
 
     if is_new_server {
         tracing::info!("Active server found: {}", addr);
+        println!("[FOUND] Server: {}", addr);
+        if let Some(players) = &players {
+            println!("  Players: {:?}", players);
+        }
+        if let Some(version) = &version {
+            println!("  Version: {:?}", version);
+        }
+        if let Some(favicon) = &favicon {
+            println!(
+                "  Favicon: {}...",
+                &favicon.chars().take(30).collect::<String>()
+            );
+        }
+        if let Some(enforces_secure_chat) = enforces_secure_chat {
+            println!("  Enforces Secure Chat: {}", enforces_secure_chat);
+        }
     }
 
     if let Some(old_players) = old_players_opt {
@@ -717,8 +491,7 @@ async fn save_player_leaves(
             let res = row.try_get("id");
             let res = match res {
                 Ok(id) => id,
-                Err(e) => {
-                    error!("Error getting player ID: {}", e);
+                Err(_) => {
                     continue;
                 }
             };
@@ -735,9 +508,7 @@ async fn save_player_leaves(
     }
 }
 
-#[derive(
-    Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Default, ToSql, FromSql,
-)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Default, ToSql, FromSql)]
 #[postgres(name = "players")]
 struct Players {
     max: Option<i32>,
@@ -820,132 +591,333 @@ fn extract_players(players: Option<Players>) -> Vec<(String, String)> {
     result
 }
 
-async fn get_user_id(client: &tokio_postgres::Client, name: &str, uuid: &str) -> Option<i32> {
-    let row = client
-        .query_one(
-            "SELECT id FROM player_list WHERE name = $1 AND uuid = $2",
-            &[&name, &uuid],
-        )
-        .await
-        .ok()?;
-    let id: i32 = row.get("id");
-    Some(id)
-}
-
-pub fn name_to_uuid(username: &str) -> String {
-    let mut hash = md5::compute(format!("OfflinePlayer:{}", username)).0;
-    hash[6] = hash[6] & 0x0f | 0x30;
-    hash[8] = hash[8] & 0x3f | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]),
-        u16::from_be_bytes([hash[4], hash[5]]),
-        u16::from_be_bytes([hash[6], hash[7]]),
-        u16::from_be_bytes([hash[8], hash[9]]),
-        u64::from_be_bytes([
-            hash[10], hash[11], hash[12], hash[13], hash[14], hash[15], 0, 0
-        ]) >> 16
+async fn scan_server(ip: u32, port: u16, pool: Arc<Pool>, timeout: u64) -> bool {
+    let ip = u32_to_ipv4_string(ip);
+    println!("🔍 Scanning {}:{}", ip, port);
+    // Add detailed logging for each step
+    match tokio::time::timeout(
+        Duration::from_millis(timeout),
+        TcpStream::connect((ip.clone(), port)),
     )
-}
-
-async fn run_masscan(command: &str, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(format!("{} > {}", command, output_file));
-    let status = cmd.status().await?;
-    if !status.success() {
-        return Err(format!("masscan failed with status: {}", status).into());
-    }
-    Ok(())
-}
-
-async fn process_masscan_json(
-    json_file: &str,
-    pool: Pool,
-    blacklist: Arc<Blacklist>,
-    config: Arc<Config>,
-    timeout_duration: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(json_file).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(
-        config.worker_count * config.concurrency_per_worker,
-    ));
-    while let Some(line) = lines.next_line().await? {
-        if !line.trim().starts_with('{') {
-            continue;
+    .await
+    {
+        Ok(Ok(mut stream)) => {
+            println!("🔗 Connected to {}:{}", ip, port);
+            let handshake = create_handshake_packet(757, &ip.clone(), port, 1).await;
+            if let Err(e) = stream.write_all(&handshake).await {
+                println!("[ERROR] {}:{} handshake failed: {}", ip, port, e);
+                return false;
+            }
+            println!("🤝 Handshake sent to {}:{}", ip, port);
+            let status = create_status_request().await;
+            if let Err(e) = stream.write_all(&status).await {
+                println!("[ERROR] {}:{} status request failed: {}", ip, port, e);
+                return false;
+            }
+            println!("📜 Status request sent to {}:{}", ip, port);
+            let len = match read_var_int_from_stream(&mut stream).await {
+                Ok(l) => l,
+                Err(e) => {
+                    println!("[ERROR] {}:{} failed to read varint: {}", ip, port, e);
+                    return false;
+                }
+            };
+            let mut buffer = vec![0; len as usize];
+            if let Err(e) = stream.read_exact(&mut buffer).await {
+                println!("[ERROR] {}:{} read failed: {}", ip, port, e);
+                return false;
+            }
+            println!("📦 Received {} bytes from {}:{}", buffer.len(), ip, port);
+            let mut index = 0;
+            let _ = read_var_int(&buffer, Some(&mut index));
+            let response = read_string(&buffer, &mut index).ok();
+            let client = match pool.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("[ERROR] DB pool error: {}", e);
+                    return false;
+                }
+            };
+            if let Some(resp) = response {
+                println!("✅ Got response for {}:{}", ip, port);
+                save_json(&ip.to_string(), &resp, &client).await;
+                return true;
+            } else {
+                println!(
+                    "[ERROR] {}:{} response could not be parsed as string",
+                    ip, port
+                );
+            }
         }
-        let value: serde_json::Value = serde_json::from_str(&line)?;
-        if let (Some(ip), Some(port)) = (value["ip"].as_str(), value["ports"].as_array()) {
-            let ip: Ipv4Addr = ip.parse()?;
-            for port_obj in port {
-                if let Some(port_num) = port_obj["port"].as_u64() {
-                    let port = port_num as u16;
-                    if blacklist.contains(&ip) {
-                        continue;
-                    }
-                    let socket = SocketAddr::new(ip.into(), port);
-                    let permit = semaphore.clone().acquire_owned().await?;
-                    let pool = pool.clone();
-                    let config = config.clone();
-                    let blacklist = blacklist.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        handle_ip(socket, pool, timeout_duration, config, true, blacklist).await;
-                    });
+        Ok(Err(e)) => {
+            println!("[ERROR] {}:{} TCP connect failed: {}", ip, port, e);
+        }
+        Err(e) => {
+            println!("[ERROR] {}:{} TCP connect timeout: {}", ip, port, e);
+        }
+    }
+    println!("❌ {}:{} is not a valid Minecraft server", ip, port);
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ip(
+    ip: u32,
+    port: u16,
+    config: Arc<Config>,
+    advanced: bool,
+    seen_ip_ports: Arc<Mutex<HashSet<(u32, u16)>>>,
+    seen_ips: Arc<Mutex<HashMap<u32, u8>>>,
+    tx: mpsc::Sender<CompressedTarget>,
+    pool: Arc<Pool>,
+) {
+    let ip_addr = Ipv4Addr::from(ip);
+    let key = (ip, port);
+
+    {
+        let mut scanned = seen_ip_ports.lock().await;
+        if scanned.contains(&key) {
+            return;
+        }
+        scanned.insert(key);
+    }
+
+    println!("🔎 Scanning {}:{}", ip_addr, port);
+
+    let is_mc_server = scan_server(ip, port, pool, config.timeout_ms).await;
+    if !is_mc_server {
+        return;
+    }
+
+    let seen_count = {
+        let mut ips = seen_ips.lock().await;
+        let entry = ips.entry(ip).or_insert(0);
+        *entry += 1;
+        *entry
+    };
+
+    // When a Minecraft server is found, always do a root scan on that IP
+    if seen_count == 1 {
+        println!("⚠️ ROOT SCAN on {}", ip_addr);
+        let ip_str = format!("{}", ip_addr);
+        let results = run_masscan_custom(
+            &ip_str,
+            "1024-65535",
+            config.masscan_rate,
+            &config.blacklist_file,
+            config.masscan_use_sudo,
+        );
+        for result in results {
+            let _ = tx.send(result).await;
+        }
+        // After root scan, do ISP scan if enabled
+        if advanced && config.isp_scan_enabled {
+            println!("🌐 ISP Scan for {}", ip_addr);
+            let subnet_range = format!(
+                "{}.{}.{}.0/24",
+                ip_addr.octets()[0],
+                ip_addr.octets()[1],
+                ip_addr.octets()[2]
+            );
+            let results = run_masscan_custom(
+                &subnet_range,
+                "2500-2600",
+                config.masscan_rate,
+                &config.blacklist_file,
+                config.masscan_use_sudo,
+            );
+            for result in results {
+                // For each ISP scan result, do a root scan
+                let ip_str = u32_to_ipv4_string(result.ip);
+                println!("⚠️ ROOT SCAN on ISP result {}", ip_str);
+                let root_results = run_masscan_custom(
+                    &ip_str,
+                    "1024-65535",
+                    config.masscan_rate,
+                    &config.blacklist_file,
+                    config.masscan_use_sudo,
+                );
+                for root_result in root_results {
+                    let _ = tx.send(root_result).await;
                 }
             }
         }
     }
-    // Wait for all tasks to complete
-    let permits = config.worker_count * config.concurrency_per_worker;
-    for _ in 0..permits {
-        let _ = semaphore.acquire().await;
-    }
+}
+
+pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute(
+            r#"
+        -- Conditionally create custom types if they do not exist
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'action_type') THEN
+                CREATE TYPE action_type AS ENUM ('JOINED', 'LEFT');
+            END IF;
+        END$$;
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'player') THEN
+                CREATE TYPE player AS (
+                    name TEXT,
+                    id TEXT
+                );
+            END IF;
+        END$$;
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'version') THEN
+                CREATE TYPE version AS (
+                    name TEXT,
+                    protocol INTEGER
+                );
+            END IF;
+        END$$;
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'players') THEN
+                CREATE TYPE players AS (
+                    max INTEGER,
+                    online INTEGER,
+                    sample player[]
+                );
+            END IF;
+        END$$;
+
+        -- Create servers table
+        CREATE TABLE IF NOT EXISTS servers (
+            id SERIAL PRIMARY KEY,
+            ip TEXT NOT NULL UNIQUE,
+            description TEXT,
+            raw_description JSONB,
+            players players,
+            version version,
+            favicon TEXT,
+            enforces_secure_chat BOOLEAN,
+            extra JSONB,
+            last_pinged TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Create player list table
+        CREATE TABLE IF NOT EXISTS player_list (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            uuid TEXT NOT NULL,
+            cracked BOOLEAN NOT NULL,
+            UNIQUE (uuid, name)
+        );
+
+        -- Create player actions table
+        CREATE TABLE IF NOT EXISTS player_actions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES player_list(id),
+            server_id INTEGER NOT NULL REFERENCES servers(id),
+            action action_type NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Create validator status table (for validator only)
+        CREATE TABLE IF NOT EXISTS validator_status (
+            id SERIAL PRIMARY KEY,
+            ips_validated INTEGER NOT NULL,
+            ips_active INTEGER NOT NULL,
+            ips_validated_list TEXT[] NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Create scanner status table (for scanner only)
+        CREATE TABLE IF NOT EXISTS status (
+            id SERIAL PRIMARY KEY,
+            ips_scanned INTEGER NOT NULL,
+            ips_active INTEGER NOT NULL,
+            ips_active_list TEXT[] NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Create index on player_list for faster lookups
+        CREATE INDEX IF NOT EXISTS idx_player_list_name_uuid ON player_list (name, uuid);
+        "#,
+        )
+        .await?;
+
     Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
-    let config_data = tokio::fs::read_to_string("config.toml")
+    let raw = fs::read_to_string("config.toml").expect("Failed to read config.toml");
+    let config: Config = toml::from_str(&raw).expect("Failed to parse TOML");
+    let arc_config = Arc::new(config);
+
+    let mut db_config = deadpool_postgres::Config::new();
+    db_config.url = Some(arc_config.database_url.clone());
+    db_config.manager = Some(ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    });
+    let pool = db_config
+        .create_pool(Some(Runtime::Tokio1), NoTls)
+        .expect("Failed to create pool");
+    let pool = Arc::new(pool);
+
+    // Initialize database
+    let client = pool.get().await.expect("Failed to get database client");
+    db_init(&client)
         .await
-        .expect("Failed to read config.toml");
-    let config: Config = toml::from_str(&config_data).expect("Invalid config format");
-    let blacklist = Arc::new(
-        load_blacklist(&config.blacklist_file)
-            .await
-            .expect("Failed to load blacklist"),
+        .expect("Database initialization failed");
+
+    let seen_ip_ports = Arc::new(Mutex::new(HashSet::new()));
+    let seen_ips = Arc::new(Mutex::new(HashMap::new()));
+
+    let targets = run_masscan_custom(
+        &arc_config.ip_range,
+        "25565",
+        arc_config.masscan_rate,
+        &arc_config.blacklist_file,
+        arc_config.masscan_use_sudo,
     );
-    let pg_config = config
-        .db_url
-        .parse::<tokio_postgres::Config>()
-        .expect("Invalid db_url");
-    let mgr = Manager::new(pg_config, NoTls);
-    let pool = Pool::builder(mgr).build().unwrap();
-    let client = pool.get().await.expect("Failed to get DB client");
-    db_init(&client).await.expect("Failed to initialize DB");
-    let timeout_duration = Duration::from_millis(config.timeout_ms);
-    let config = Arc::new(config);
-    // Run masscan and save JSON results
-    let masscan_output = "masscan_output.json";
-    let masscan_command = format!(
-        "sudo masscan 0.0.0.0/0 -p25565 --rate {} -oJ - --excludefile {}",
-        config.scan_rate, config.blacklist_file
-    );
-    if let Err(e) = run_masscan(&masscan_command, masscan_output).await {
-        error!("Masscan failed: {}", e);
-        return;
+
+    let (tx, rx) = mpsc::channel::<CompressedTarget>(10000);
+    for target in targets {
+        println!(
+            "🔎 Found target: {}:{}",
+            u32_to_ipv4_string(target.ip),
+            target.port
+        );
+        tx.send(target).await.unwrap();
     }
-    process_masscan_json(
-        masscan_output,
-        pool.clone(),
-        Arc::clone(&blacklist),
-        Arc::clone(&config),
-        timeout_duration,
-    )
-    .await
-    .expect("Failed to process masscan results");
-    // Cleanup temporary file
-    let _ = tokio::fs::remove_file(masscan_output).await;
+
+    // Only spawn one receiver loop, and share the receiver among all tasks
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..arc_config.mc_checker_threads {
+        let rx = rx.clone();
+        let cfg = arc_config.clone();
+        let seen_ip_ports = seen_ip_ports.clone();
+        let seen_ips = seen_ips.clone();
+        let tx = tx.clone();
+        let pool = pool.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let target = {
+                    let mut rx = rx.lock().await;
+                    rx.recv().await
+                };
+                if let Some(target) = target {
+                    handle_ip(
+                        target.ip,
+                        target.port,
+                        cfg.clone(),
+                        true,
+                        seen_ip_ports.clone(),
+                        seen_ips.clone(),
+                        tx.clone(),
+                        pool.clone(),
+                    )
+                    .await;
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    println!("✅ Done");
 }

@@ -19,3 +19,6 @@ rand = "0.9.1"
 deadpool-postgres = "0.14.1"
 futures = "0.3.31"
 pin-utils = "0.1.0"
+reqwest = { version = "0.12.20", features = ["json"] }
+anyhow = "1.0.98"
+dashmap = "6.1.0"
