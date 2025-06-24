@@ -1,8 +1,8 @@
-ip_range = "95.31.210.66"
+ip_range = "0.0.0.0/0"
 masscan_rate = 1000
 isp_scan_enabled = true
 mc_checker_threads = 50
 database_url = "host=127.0.0.1 port=5555 user=mc_scanner password=pwd dbname=mc_scanner"
 timeout_ms = 6000
-blacklist_file = "exclude.conf-v2"
+blacklist_file = "exclude.conf"
 masscan_use_sudo = true
