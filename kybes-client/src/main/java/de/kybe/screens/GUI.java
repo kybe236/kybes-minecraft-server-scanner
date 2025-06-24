@@ -16,21 +16,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class GUI extends Screen {
-  private final List<Module> modules = ModuleManager.getAll().stream().toList();
-  private final ArrayList<Integer> settingIndexes = new ArrayList<>();
-  private int moduleIndex = 0;
-  private int subSettingDepth = 0;
-  private boolean inSettings = false;
-  private boolean editing = false;
-  private String editBuffer = "";
-  private boolean waitingForBindKey = false;
-  private int cursorPosition = 0;
-  private boolean allSelected = false;
-  public GUI() {
-    super(Component.literal("KYBE"));
-    settingIndexes.add(0);
-  }
-
   private int getSelectedColor() {
     GUIModule guiModule = (GUIModule) ModuleManager.getByName("GUI");
     return guiModule != null ? guiModule.selectedColor.getValue() : 0xFFFFFFFF;
@@ -49,6 +34,22 @@ public class GUI extends Screen {
   private int getCursorColor() {
     GUIModule guiModule = (GUIModule) ModuleManager.getByName("GUI");
     return guiModule != null ? guiModule.cursorColor.getValue() : 0xFF00FF00;
+  }
+
+  private final List<Module> modules = ModuleManager.getAll().stream().toList();
+  private final ArrayList<Integer> settingIndexes = new ArrayList<>();
+  private int moduleIndex = 0;
+  private int subSettingDepth = 0;
+  private boolean inSettings = false;
+  private boolean editing = false;
+  private String editBuffer = "";
+  private boolean waitingForBindKey = false;
+  private int cursorPosition = 0;
+  private boolean allSelected = false;
+
+  public GUI() {
+    super(Component.literal("KYBE"));
+    settingIndexes.add(0);
   }
 
   @Override
@@ -146,10 +147,10 @@ public class GUI extends Screen {
     float b = b1 * (1 - ratio) + b2 * ratio;
     float a = a1 * (1 - ratio) + a2 * ratio;
 
-    int ir = (int) (r * 255) & 0xFF;
-    int ig = (int) (g * 255) & 0xFF;
-    int ib = (int) (b * 255) & 0xFF;
-    int ia = (int) (a * 255) & 0xFF;
+    int ir = (int)(r * 255) & 0xFF;
+    int ig = (int)(g * 255) & 0xFF;
+    int ib = (int)(b * 255) & 0xFF;
+    int ia = (int)(a * 255) & 0xFF;
 
     return (ia << 24) | (ir << 16) | (ig << 8) | ib;
   }
