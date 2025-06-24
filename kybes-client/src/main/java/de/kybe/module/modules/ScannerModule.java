@@ -32,7 +32,7 @@ public class ScannerModule extends ToggleableModule {
   });
 
   public ScannerModule() {
-    super("ScannerModule Accessor Module");
+    super("Scanner Accessor");
 
     NullSetting ndburl = new NullSetting("Database URL");
     ndburl.addSubSetting(dburl);
@@ -56,8 +56,6 @@ public class ScannerModule extends ToggleableModule {
   protected void onToggled(boolean toggled) {
     if (!toggled) return;
 
-    System.out.println("ScannerModule module toggled on. Query: " + query.getValue());
-
     String url = dburl.getValue();
     String user = dbuser.getValue();
     String password = dbpassword.getValue();
@@ -65,7 +63,6 @@ public class ScannerModule extends ToggleableModule {
 
     ServerList serverList = new ServerList(mc);
     serverList.load();
-
 
     try {
       Class.forName("org.postgresql.Driver");
