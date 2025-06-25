@@ -16,13 +16,13 @@ import static de.kybe.Constants.mc;
 @Mixin(ServerSelectionList.OnlineServerEntry.class)
 public class OnlineServerEntryMixin {
   @Unique
-  private int buttonX;
-  @Unique
-  private int buttonY;
-  @Unique
   private final int buttonWidth = 15;
   @Unique
   private final int buttonHeight = 15;
+  @Unique
+  private int buttonX;
+  @Unique
+  private int buttonY;
 
   @Inject(method = "render", at = @At("TAIL"))
   private void renderCustomButton(

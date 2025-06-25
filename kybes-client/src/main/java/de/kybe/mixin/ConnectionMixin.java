@@ -15,23 +15,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Connection.class)
 public class ConnectionMixin {
-  @Inject(method = "send(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
-    at = @At("HEAD"),
-    cancellable = true)
-  private void onSend(Packet<?> packet, @Nullable ChannelFutureListener listener, boolean bl, CallbackInfo ci) {
-    EventPacketSent event = new EventPacketSent(packet);
-    EventManager.call(event);
-
-    if (event.isCancelled()) {
-      ci.cancel();
-    } else if (event.getPacket() != packet) {
-      ci.cancel();
-
-      Connection connection = (Connection)(Object)this;
-      connection.send(event.getPacket(), listener, bl);
-    }
-  }
-
   @SuppressWarnings("unchecked")
   @Inject(method = "genericsFtw",
     at = @At("HEAD"),
@@ -45,7 +28,24 @@ public class ConnectionMixin {
     } else if (event.getPacket() != packet) {
       ci.cancel();
 
-      ((Packet) event.getPacket()).handle((PacketListener) listener);
+      ((Packet) event.getPacket()).handle(listener);
+    }
+  }
+
+  @Inject(method = "send(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
+    at = @At("HEAD"),
+    cancellable = true)
+  private void onSend(Packet<?> packet, @Nullable ChannelFutureListener listener, boolean bl, CallbackInfo ci) {
+    EventPacketSent event = new EventPacketSent(packet);
+    EventManager.call(event);
+
+    if (event.isCancelled()) {
+      ci.cancel();
+    } else if (event.getPacket() != packet) {
+      ci.cancel();
+
+      Connection connection = (Connection) (Object) this;
+      connection.send(event.getPacket(), listener, bl);
     }
   }
 }

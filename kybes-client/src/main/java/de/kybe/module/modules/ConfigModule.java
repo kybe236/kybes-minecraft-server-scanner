@@ -13,29 +13,23 @@ public class ConfigModule extends Module {
     .onChange((oldValue, newValue) -> Config.setAutoSave(newValue));
   @SuppressWarnings("unchecked")
   private final NumberSetting<Integer> autoSaveIntervalTicks = (NumberSetting<Integer>) new NumberSetting<>("Auto Save Interval Ticks", 20 * 15)
-    .onChange((oldValue, newValue) -> Config.setAutoSaveInterval(newValue));  public final BooleanSetting load = (BooleanSetting) new BooleanSetting("Load", false)
+    .onChange((oldValue, newValue) -> Config.setAutoSaveInterval(newValue));
+  public ConfigModule() {
+    super("Config");
+    this.addSetting(load, save, autoSave, autoSaveIntervalTicks);
+  }  public final BooleanSetting load = (BooleanSetting) new BooleanSetting("Load", false)
     .onChange((oldValue, newValue) -> {
       if (newValue) {
         ((ConfigModule) ModuleManager.getByName("Config")).load.setValue(false);
         Config.load();
       }
     });
-  public ConfigModule() {
-    super("Config");
-    this.addSetting(load, save, autoSave, autoSaveIntervalTicks);
-  }
 
   @Override
   public void onLoad() {
     Config.setAutoSave(autoSave.getValue());
     Config.setAutoSaveInterval(autoSaveIntervalTicks.getValue());
-  }  private final BooleanSetting save = (BooleanSetting) new BooleanSetting("Save", false)
-    .onChange((oldValue, newValue) -> {
-      if (newValue) {
-        ((ConfigModule) ModuleManager.getByName("Config")).save.setValue(false);
-        Config.save();
-      }
-    });
+  }
 
   @KybeEvents
   @SuppressWarnings("unused")
@@ -43,7 +37,11 @@ public class ConfigModule extends Module {
     Config.tick();
   }
 
-
-
-
+  private final BooleanSetting save = (BooleanSetting) new BooleanSetting("Save", false)
+    .onChange((oldValue, newValue) -> {
+      if (newValue) {
+        ((ConfigModule) ModuleManager.getByName("Config")).save.setValue(false);
+        Config.save();
+      }
+    });
 }

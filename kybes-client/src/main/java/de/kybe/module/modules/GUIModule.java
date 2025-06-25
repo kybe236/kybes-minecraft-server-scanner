@@ -31,10 +31,7 @@ public class GUIModule extends ToggleableModule {
     Screen screen = mc.screen;
     if (screen instanceof InventoryScreen) return;
     if (screen instanceof ChatScreen) return;
-    if (screen instanceof GUI) {
-      mc.setScreen(null);
-      return;
-    }
+    if (screen instanceof GUI) return;
 
     mc.setScreen(new GUI());
     this.setToggled(false);

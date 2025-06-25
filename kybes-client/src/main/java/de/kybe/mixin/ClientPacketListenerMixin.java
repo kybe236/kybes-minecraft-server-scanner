@@ -1,6 +1,8 @@
 package de.kybe.mixin;
 
 import de.kybe.command.CommandManager;
+import de.kybe.event.EventManager;
+import de.kybe.event.events.EventLoginTail;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -14,5 +16,11 @@ public class ClientPacketListenerMixin {
     if (!input.startsWith("+")) return;
     ci.cancel();
     CommandManager.handleInput(input);
+  }
+
+  @Inject(method = "handleLogin", at = @At("TAIL"))
+  public void onHandleLogin(CallbackInfo ci) {
+    EventLoginTail  event = new EventLoginTail();
+    EventManager.call(event);
   }
 }

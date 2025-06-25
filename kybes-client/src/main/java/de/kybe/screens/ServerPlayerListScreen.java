@@ -29,9 +29,7 @@ public class ServerPlayerListScreen extends Screen {
     List<String> players = ScannerModule.INSTANCE.getPlayers(serverIp);
     players.sort(String::compareToIgnoreCase);
 
-    int top = 80;
-    int bottom = this.height - 40;
-    playerListWidget = new PlayerListWidget(this.minecraft, this.width, this.height - 30, 30, this.minecraft.font.lineHeight * 2, 40, players);
+    playerListWidget = new PlayerListWidget(this.minecraft, this.width, this.height - 30, 30, this.minecraft.font.lineHeight * 2,  players);
     this.addWidget(playerListWidget);
   }
 
@@ -54,7 +52,7 @@ public class ServerPlayerListScreen extends Screen {
   // Inner class for player list widget
   private class PlayerListWidget extends ObjectSelectionList<PlayerListWidget.PlayerEntry> {
 
-    public PlayerListWidget(net.minecraft.client.Minecraft minecraft, int width, int height, int top, int itemHeight, int headerHeight, List<String> players) {
+    public PlayerListWidget(net.minecraft.client.Minecraft minecraft, int width, int height, int top, int itemHeight, List<String> players) {
       super(minecraft, width, height, top, itemHeight, itemHeight);
       for (String player : players) {
         this.addEntry(new PlayerEntry(player));

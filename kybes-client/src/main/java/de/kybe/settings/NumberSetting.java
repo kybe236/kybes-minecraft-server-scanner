@@ -45,17 +45,6 @@ public class NumberSetting<T extends Number> extends Setting<T> {
     loadSubSettings(json);
   }
 
-  public T parseValue(String str) throws NumberFormatException {
-    switch (value) {
-      case Integer ignored -> setValue((T) (Integer) Integer.parseInt(str));
-      case Double ignored -> setValue((T) (Double) Double.parseDouble(str));
-      case Float ignored -> setValue((T) (Float) Float.parseFloat(str));
-      case Long ignored -> setValue((T) (Long) Long.parseLong(str));
-      default -> throw new NumberFormatException("Unsupported number type: " + value.getClass());
-    }
-    return getValue();
-  }
-
 
   public T getValue() {
     return value;

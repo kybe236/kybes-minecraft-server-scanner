@@ -13,6 +13,7 @@ public class EventPacketSent extends CancelableEvent {
     return packet;
   }
 
+  @SuppressWarnings("unused")
   public void setPacket(Packet<?> packet) {
     this.packet = packet;
   }

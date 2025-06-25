@@ -2,7 +2,6 @@ package de.kybe.module.modules;
 
 import de.kybe.event.KybeEvents;
 import de.kybe.event.events.EventTick;
-import de.kybe.event.events.KeyPressEvent;
 import de.kybe.module.ToggleableModule;
 import de.kybe.settings.BooleanSetting;
 import de.kybe.settings.NumberSetting;
@@ -24,6 +23,7 @@ public class FlightModule extends ToggleableModule {
   }
 
   @KybeEvents
+  @SuppressWarnings("unused")
   public void onTick(EventTick event) {
     if (!this.isToggled()) return;
     if (mc.player == null) return;
@@ -55,8 +55,10 @@ public class FlightModule extends ToggleableModule {
     if (jump) motion = motion.add(0, vSpeed, 0);
     if (sneak) motion = motion.subtract(0, vSpeed, 0);
 
-    if (antiKick.getValue() && tickCounter == 10) {
-      motion = motion.subtract(0, 0.1, 0);
+    if (antiKick.getValue() && tickCounter % 5 == 0) {
+      motion = motion.subtract(0, 0.2, 0);
+    } else if if (antiKick.getValue() && tickCounter % 10 == 0) {
+      motion = motion.add(0, 0.2, 0);
     }
 
     mc.player.setDeltaMovement(motion);

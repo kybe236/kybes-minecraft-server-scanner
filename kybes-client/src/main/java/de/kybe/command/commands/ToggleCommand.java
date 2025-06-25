@@ -6,16 +6,14 @@ import de.kybe.module.ModuleManager;
 import de.kybe.module.ToggleableModule;
 import de.kybe.utils.ChatUtils;
 
-import static de.kybe.Constants.mc;
-
 public class ToggleCommand extends Command {
-  public ToggleCommand () {
+  public ToggleCommand() {
     super("toggle", "t");
   }
 
   @Override
   public void execute(String[] args) {
-    if (args.length == 0) {;
+    if (args.length == 0) {
       ChatUtils.print("Usage: .toggle <modulename>");
       return;
     }

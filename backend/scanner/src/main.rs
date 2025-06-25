@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::unix::SocketAddr;
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::NoTls;
 use tracing::error;
@@ -591,7 +590,7 @@ fn extract_players(players: Option<Players>) -> Vec<(String, String)> {
     result
 }
 
-async fn scan_server(ip: u32, port: u16, pool: Arc<Pool>, timeout: u64) -> bool {
+async fn scan_server(ip: u32, port: u16, pool: &Arc<Pool>, timeout: u64) -> bool {
     let ip = u32_to_ipv4_string(ip);
     println!("🔍 Scanning {}:{}", ip, port);
     // Add detailed logging for each step
@@ -660,6 +659,130 @@ async fn scan_server(ip: u32, port: u16, pool: Arc<Pool>, timeout: u64) -> bool 
     false
 }
 
+use std::future::Future;
+use std::pin::Pin;
+
+// Limit recursion depth to prevent infinite loops
+const MAX_RECURSION_DEPTH: usize = 5;
+
+#[allow(clippy::too_many_arguments)]
+fn handle_ip_boxed(
+    ip: u32,
+    port: u16,
+    config: Arc<Config>,
+    advanced: bool,
+    seen_ip_ports: Arc<Mutex<HashSet<(u32, u16)>>>,
+    seen_ips: Arc<Mutex<HashMap<u32, u8>>>,
+    tx: mpsc::Sender<CompressedTarget>,
+    pool: Arc<Pool>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    // Only use pool in scan_server, never move it into recursion
+    Box::pin(async move {
+        if depth > MAX_RECURSION_DEPTH {
+            println!(
+                "[WARN] Max recursion depth reached for {}:{}",
+                u32_to_ipv4_string(ip),
+                port
+            );
+            return;
+        }
+        let ip_addr = Ipv4Addr::from(ip);
+        let key = (ip, port);
+
+        {
+            let mut scanned = seen_ip_ports.lock().await;
+            if scanned.contains(&key) {
+                return;
+            }
+            scanned.insert(key);
+        }
+
+        println!("🔎 Scanning {}:{}", ip_addr, port);
+
+        let is_mc_server = scan_server(ip, port, &pool, config.timeout_ms).await;
+        if !is_mc_server {
+            return;
+        }
+
+        let seen_count = {
+            let mut ips = seen_ips.lock().await;
+            let entry = ips.entry(ip).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        if seen_count == 1 {
+            println!("⚠️ ROOT SCAN on {}", ip_addr);
+            let ip_str = format!("{}", ip_addr);
+            let results = run_masscan_custom(
+                &ip_str,
+                "1024-65535",
+                config.masscan_rate,
+                &config.blacklist_file,
+                config.masscan_use_sudo,
+            );
+            for result in results {
+                let pool_clone = pool.clone();
+                handle_ip_boxed(
+                    result.ip,
+                    result.port,
+                    config.clone(),
+                    advanced,
+                    seen_ip_ports.clone(),
+                    seen_ips.clone(),
+                    tx.clone(),
+                    pool_clone,
+                    depth + 1,
+                )
+                .await;
+            }
+            if advanced && config.isp_scan_enabled {
+                println!("🌐 ISP Scan for {}", ip_addr);
+                let subnet_range = format!(
+                    "{}.{}.{}.0/24",
+                    ip_addr.octets()[0],
+                    ip_addr.octets()[1],
+                    ip_addr.octets()[2]
+                );
+                let results = run_masscan_custom(
+                    &subnet_range,
+                    "2500-2600",
+                    config.masscan_rate,
+                    &config.blacklist_file,
+                    config.masscan_use_sudo,
+                );
+                for result in results {
+                    let ip_str = u32_to_ipv4_string(result.ip);
+                    println!("⚠️ ROOT SCAN on ISP result {}", ip_str);
+                    let root_results = run_masscan_custom(
+                        &ip_str,
+                        "1024-65535",
+                        config.masscan_rate,
+                        &config.blacklist_file,
+                        config.masscan_use_sudo,
+                    );
+                    for result in root_results {
+                        let pool_clone = pool.clone();
+                        handle_ip_boxed(
+                            result.ip,
+                            result.port,
+                            config.clone(),
+                            advanced,
+                            seen_ip_ports.clone(),
+                            seen_ips.clone(),
+                            tx.clone(),
+                            pool_clone,
+                            depth + 1,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_ip(
     ip: u32,
@@ -684,7 +807,7 @@ async fn handle_ip(
 
     println!("🔎 Scanning {}:{}", ip_addr, port);
 
-    let is_mc_server = scan_server(ip, port, pool, config.timeout_ms).await;
+    let is_mc_server = scan_server(ip, port, &pool, config.timeout_ms).await;
     if !is_mc_server {
         return;
     }
@@ -708,7 +831,18 @@ async fn handle_ip(
             config.masscan_use_sudo,
         );
         for result in results {
-            let _ = tx.send(result).await;
+            handle_ip_boxed(
+                result.ip,
+                result.port,
+                config.clone(),
+                advanced,
+                seen_ip_ports.clone(),
+                seen_ips.clone(),
+                tx.clone(),
+                pool.clone(),
+                1,
+            )
+            .await;
         }
         // After root scan, do ISP scan if enabled
         if advanced && config.isp_scan_enabled {
@@ -737,8 +871,19 @@ async fn handle_ip(
                     &config.blacklist_file,
                     config.masscan_use_sudo,
                 );
-                for root_result in root_results {
-                    let _ = tx.send(root_result).await;
+                for result in root_results {
+                    handle_ip_boxed(
+                        result.ip,
+                        result.port,
+                        config.clone(),
+                        advanced,
+                        seen_ip_ports.clone(),
+                        seen_ips.clone(),
+                        tx.clone(),
+                        pool.clone(),
+                        2,
+                    )
+                    .await;
                 }
             }
         }
@@ -900,7 +1045,7 @@ async fn main() {
                     rx.recv().await
                 };
                 if let Some(target) = target {
-                    handle_ip(
+                    handle_ip_boxed(
                         target.ip,
                         target.port,
                         cfg.clone(),
@@ -909,6 +1054,7 @@ async fn main() {
                         seen_ips.clone(),
                         tx.clone(),
                         pool.clone(),
+                        0,
                     )
                     .await;
                 } else {

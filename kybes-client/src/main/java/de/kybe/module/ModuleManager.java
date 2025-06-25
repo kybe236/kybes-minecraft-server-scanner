@@ -24,9 +24,9 @@ public class ModuleManager {
 
   public static Module getByNameCaseInsensitive(String name) {
     return modules.values().stream()
-        .filter(module -> module.getName().equalsIgnoreCase(name))
-        .findFirst()
-        .orElse(null);
+      .filter(module -> module.getName().equalsIgnoreCase(name))
+      .findFirst()
+      .orElse(null);
   }
 
   public static Collection<Module> getAll() {

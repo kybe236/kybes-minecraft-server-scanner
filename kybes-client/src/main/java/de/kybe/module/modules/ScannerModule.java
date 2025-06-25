@@ -22,15 +22,6 @@ public class ScannerModule extends ToggleableModule {
   private final StringSetting dbuser = new StringSetting("Database User", "mc_scanner");
   private final StringSetting dbpassword = new StringSetting("Database Password", "");
   private final StringSetting query = new StringSetting("Query", "SELECT ip FROM servers LIMIT 10");
-  public final BooleanSetting clearServers = (BooleanSetting) new BooleanSetting("Clear Servers", true).onChange((aBoolean, aBoolean2) -> {
-    if (aBoolean2) {
-      ServerList serverList = new ServerList(mc);
-      serverList.save();
-      System.out.println("Cleared server list.");
-      ScannerModule.INSTANCE.clearServers.setValue(false);
-    }
-  });
-
   public ScannerModule() {
     super("Scanner Accessor");
 
@@ -50,9 +41,17 @@ public class ScannerModule extends ToggleableModule {
     );
 
     INSTANCE = this;
-  }
+  }  public final BooleanSetting clearServers = (BooleanSetting) new BooleanSetting("Clear Servers", true).onChange((aBoolean, aBoolean2) -> {
+    if (aBoolean2) {
+      ServerList serverList = new ServerList(mc);
+      serverList.save();
+      System.out.println("Cleared server list.");
+      ScannerModule.INSTANCE.clearServers.setValue(false);
+    }
+  });
 
   @Override
+  @SuppressWarnings("CallToPrintStackTrace")
   protected void onToggled(boolean toggled) {
     if (!toggled) return;
 
@@ -87,8 +86,7 @@ public class ScannerModule extends ToggleableModule {
     this.setToggled(false);
   }
 
-
-  @SuppressWarnings("unused")
+  @SuppressWarnings("CallToPrintStackTrace")
   public List<String> getPlayers(String ip) {
     String sql = "SELECT pl.name " +
       "FROM servers " +
@@ -114,4 +112,7 @@ public class ScannerModule extends ToggleableModule {
 
     return new ArrayList<>(playersSet);
   }
+
+
+
 }

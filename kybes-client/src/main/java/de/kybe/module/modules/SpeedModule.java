@@ -11,13 +11,14 @@ import static de.kybe.Constants.mc;
 public class SpeedModule extends ToggleableModule {
   public NumberSetting<Double> multiplier = new NumberSetting<>("Multiplier", 1.0);
 
-    public SpeedModule() {
-        super("Speed");
+  public SpeedModule() {
+    super("Speed");
 
-        this.addSetting(multiplier);
-    }
+    this.addSetting(multiplier);
+  }
 
   @KybeEvents
+  @SuppressWarnings("unused")
   public void onTick(EventTick event) {
     if (!this.isToggled()) return;
     if (mc.player == null) return;

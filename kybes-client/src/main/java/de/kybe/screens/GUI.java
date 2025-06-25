@@ -16,6 +16,21 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class GUI extends Screen {
+  private final List<Module> modules = ModuleManager.getAll().stream().toList();
+  private final ArrayList<Integer> settingIndexes = new ArrayList<>();
+  private int moduleIndex = 0;
+  private int subSettingDepth = 0;
+  private boolean inSettings = false;
+  private boolean editing = false;
+  private String editBuffer = "";
+  private boolean waitingForBindKey = false;
+  private int cursorPosition = 0;
+  private boolean allSelected = false;
+  public GUI() {
+    super(Component.literal("KYBE"));
+    settingIndexes.add(0);
+  }
+
   private int getSelectedColor() {
     GUIModule guiModule = (GUIModule) ModuleManager.getByName("GUI");
     return guiModule != null ? guiModule.selectedColor.getValue() : 0xFFFFFFFF;
@@ -34,22 +49,6 @@ public class GUI extends Screen {
   private int getCursorColor() {
     GUIModule guiModule = (GUIModule) ModuleManager.getByName("GUI");
     return guiModule != null ? guiModule.cursorColor.getValue() : 0xFF00FF00;
-  }
-
-  private final List<Module> modules = ModuleManager.getAll().stream().toList();
-  private final ArrayList<Integer> settingIndexes = new ArrayList<>();
-  private int moduleIndex = 0;
-  private int subSettingDepth = 0;
-  private boolean inSettings = false;
-  private boolean editing = false;
-  private String editBuffer = "";
-  private boolean waitingForBindKey = false;
-  private int cursorPosition = 0;
-  private boolean allSelected = false;
-
-  public GUI() {
-    super(Component.literal("KYBE"));
-    settingIndexes.add(0);
   }
 
   @Override
@@ -78,7 +77,7 @@ public class GUI extends Screen {
         if (setting instanceof ColorSetting colorSetting) {
           text = setting.getName() + ": " + String.format("#%08X", colorSetting.getValue());
           if (i == currentIndex) {
-            color = blendColors(colorSetting.getValue(), 0xFFFFFFFF, 0.7f);
+            color = blendColors(colorSetting.getValue());
           } else {
             color = colorSetting.getValue();
           }
@@ -131,26 +130,26 @@ public class GUI extends Screen {
     drawStrings(font, graphics, width, height, lines, 2, getUnselectedColor());
   }
 
-  private int blendColors(int color1, int color2, float ratio) {
+  private int blendColors(int color1) {
     float r1 = ((color1 >> 16) & 0xFF) / 255f;
     float g1 = ((color1 >> 8) & 0xFF) / 255f;
     float b1 = (color1 & 0xFF) / 255f;
     float a1 = ((color1 >> 24) & 0xFF) / 255f;
 
-    float r2 = ((color2 >> 16) & 0xFF) / 255f;
-    float g2 = ((color2 >> 8) & 0xFF) / 255f;
-    float b2 = (color2 & 0xFF) / 255f;
-    float a2 = ((color2 >> 24) & 0xFF) / 255f;
+    float r2 = ((-1 >> 16) & 0xFF) / 255f;
+    float g2 = ((-1 >> 8) & 0xFF) / 255f;
+    float b2 = (0xFF) / 255f;
+    float a2 = ((-1 >> 24) & 0xFF) / 255f;
 
-    float r = r1 * (1 - ratio) + r2 * ratio;
-    float g = g1 * (1 - ratio) + g2 * ratio;
-    float b = b1 * (1 - ratio) + b2 * ratio;
-    float a = a1 * (1 - ratio) + a2 * ratio;
+    float r = r1 * (1 - (float) 0.7) + r2 * (float) 0.7;
+    float g = g1 * (1 - (float) 0.7) + g2 * (float) 0.7;
+    float b = b1 * (1 - (float) 0.7) + b2 * (float) 0.7;
+    float a = a1 * (1 - (float) 0.7) + a2 * (float) 0.7;
 
-    int ir = (int)(r * 255) & 0xFF;
-    int ig = (int)(g * 255) & 0xFF;
-    int ib = (int)(b * 255) & 0xFF;
-    int ia = (int)(a * 255) & 0xFF;
+    int ir = (int) (r * 255) & 0xFF;
+    int ig = (int) (g * 255) & 0xFF;
+    int ib = (int) (b * 255) & 0xFF;
+    int ia = (int) (a * 255) & 0xFF;
 
     return (ia << 24) | (ir << 16) | (ig << 8) | ib;
   }
@@ -167,6 +166,7 @@ public class GUI extends Screen {
   }
 
   @Override
+  @SuppressWarnings("CallToPrintStackTrace")
   public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
     if (editing) {
       // Handle Ctrl+A (select all)
@@ -202,14 +202,8 @@ public class GUI extends Screen {
 
       // Handle regular Del key
       if (keyCode == GLFW.GLFW_KEY_DELETE && cursorPosition < editBuffer.length()) {
-        if (allSelected) {
-          editBuffer = "";
-          cursorPosition = 0;
-          allSelected = false;
-        } else {
-          editBuffer = editBuffer.substring(0, cursorPosition) +
-            editBuffer.substring(cursorPosition + 1);
-        }
+        editBuffer = editBuffer.substring(0, cursorPosition) +
+          editBuffer.substring(cursorPosition + 1);
         return true;
       }
     }
