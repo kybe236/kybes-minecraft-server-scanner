@@ -22,6 +22,7 @@ public class KybesClient implements ModInitializer {
     ModuleManager.register(new FlightModule());
     ModuleManager.register(new NoFallModule());
     ModuleManager.register(new AutoCommandModule());
+    ModuleManager.register(new BundleTestModule());
 
     // COMMANDS
     CommandManager.register(new ToggleCommand());

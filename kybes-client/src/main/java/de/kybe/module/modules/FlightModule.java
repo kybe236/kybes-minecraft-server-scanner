@@ -57,7 +57,7 @@ public class FlightModule extends ToggleableModule {
 
     if (antiKick.getValue() && tickCounter % 5 == 0) {
       motion = motion.subtract(0, 0.2, 0);
-    } else if if (antiKick.getValue() && tickCounter % 10 == 0) {
+    } else if (antiKick.getValue() && tickCounter % 10 == 0) {
       motion = motion.add(0, 0.2, 0);
     }
 

@@ -1,6 +1,8 @@
 /api/target
 /backend/scanner/target
 /backend/verifier/target
+/honeypot/target
+**/.env
 
 /kybes-client/.idea/
 /kybes-client/*.iml

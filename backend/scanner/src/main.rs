@@ -607,12 +607,14 @@ async fn scan_server(ip: u32, port: u16, pool: &Arc<Pool>, timeout: u64) -> bool
                 println!("[ERROR] {}:{} handshake failed: {}", ip, port, e);
                 return false;
             }
+
             println!("🤝 Handshake sent to {}:{}", ip, port);
             let status = create_status_request().await;
             if let Err(e) = stream.write_all(&status).await {
                 println!("[ERROR] {}:{} status request failed: {}", ip, port, e);
                 return false;
             }
+
             println!("📜 Status request sent to {}:{}", ip, port);
             let len = match read_var_int_from_stream(&mut stream).await {
                 Ok(l) => l,
@@ -621,11 +623,13 @@ async fn scan_server(ip: u32, port: u16, pool: &Arc<Pool>, timeout: u64) -> bool
                     return false;
                 }
             };
+
             let mut buffer = vec![0; len as usize];
             if let Err(e) = stream.read_exact(&mut buffer).await {
                 println!("[ERROR] {}:{} read failed: {}", ip, port, e);
                 return false;
             }
+
             println!("📦 Received {} bytes from {}:{}", buffer.len(), ip, port);
             let mut index = 0;
             let _ = read_var_int(&buffer, Some(&mut index));
@@ -637,6 +641,7 @@ async fn scan_server(ip: u32, port: u16, pool: &Arc<Pool>, timeout: u64) -> bool
                     return false;
                 }
             };
+
             if let Some(resp) = response {
                 println!("✅ Got response for {}:{}", ip, port);
                 save_json(&ip.to_string(), &resp, &client).await;
@@ -673,7 +678,6 @@ fn handle_ip_boxed(
     advanced: bool,
     seen_ip_ports: Arc<Mutex<HashSet<(u32, u16)>>>,
     seen_ips: Arc<Mutex<HashMap<u32, u8>>>,
-    tx: mpsc::Sender<CompressedTarget>,
     pool: Arc<Pool>,
     depth: usize,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -698,7 +702,7 @@ fn handle_ip_boxed(
             scanned.insert(key);
         }
 
-        println!("🔎 Scanning {}:{}", ip_addr, port);
+        println!("🔎 Pinging {}:{}", ip_addr, port);
 
         let is_mc_server = scan_server(ip, port, &pool, config.timeout_ms).await;
         if !is_mc_server {
@@ -731,7 +735,6 @@ fn handle_ip_boxed(
                     advanced,
                     seen_ip_ports.clone(),
                     seen_ips.clone(),
-                    tx.clone(),
                     pool_clone,
                     depth + 1,
                 )
@@ -771,7 +774,6 @@ fn handle_ip_boxed(
                             advanced,
                             seen_ip_ports.clone(),
                             seen_ips.clone(),
-                            tx.clone(),
                             pool_clone,
                             depth + 1,
                         )
@@ -781,113 +783,6 @@ fn handle_ip_boxed(
             }
         }
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_ip(
-    ip: u32,
-    port: u16,
-    config: Arc<Config>,
-    advanced: bool,
-    seen_ip_ports: Arc<Mutex<HashSet<(u32, u16)>>>,
-    seen_ips: Arc<Mutex<HashMap<u32, u8>>>,
-    tx: mpsc::Sender<CompressedTarget>,
-    pool: Arc<Pool>,
-) {
-    let ip_addr = Ipv4Addr::from(ip);
-    let key = (ip, port);
-
-    {
-        let mut scanned = seen_ip_ports.lock().await;
-        if scanned.contains(&key) {
-            return;
-        }
-        scanned.insert(key);
-    }
-
-    println!("🔎 Scanning {}:{}", ip_addr, port);
-
-    let is_mc_server = scan_server(ip, port, &pool, config.timeout_ms).await;
-    if !is_mc_server {
-        return;
-    }
-
-    let seen_count = {
-        let mut ips = seen_ips.lock().await;
-        let entry = ips.entry(ip).or_insert(0);
-        *entry += 1;
-        *entry
-    };
-
-    // When a Minecraft server is found, always do a root scan on that IP
-    if seen_count == 1 {
-        println!("⚠️ ROOT SCAN on {}", ip_addr);
-        let ip_str = format!("{}", ip_addr);
-        let results = run_masscan_custom(
-            &ip_str,
-            "1024-65535",
-            config.masscan_rate,
-            &config.blacklist_file,
-            config.masscan_use_sudo,
-        );
-        for result in results {
-            handle_ip_boxed(
-                result.ip,
-                result.port,
-                config.clone(),
-                advanced,
-                seen_ip_ports.clone(),
-                seen_ips.clone(),
-                tx.clone(),
-                pool.clone(),
-                1,
-            )
-            .await;
-        }
-        // After root scan, do ISP scan if enabled
-        if advanced && config.isp_scan_enabled {
-            println!("🌐 ISP Scan for {}", ip_addr);
-            let subnet_range = format!(
-                "{}.{}.{}.0/24",
-                ip_addr.octets()[0],
-                ip_addr.octets()[1],
-                ip_addr.octets()[2]
-            );
-            let results = run_masscan_custom(
-                &subnet_range,
-                "2500-2600",
-                config.masscan_rate,
-                &config.blacklist_file,
-                config.masscan_use_sudo,
-            );
-            for result in results {
-                // For each ISP scan result, do a root scan
-                let ip_str = u32_to_ipv4_string(result.ip);
-                println!("⚠️ ROOT SCAN on ISP result {}", ip_str);
-                let root_results = run_masscan_custom(
-                    &ip_str,
-                    "1024-65535",
-                    config.masscan_rate,
-                    &config.blacklist_file,
-                    config.masscan_use_sudo,
-                );
-                for result in root_results {
-                    handle_ip_boxed(
-                        result.ip,
-                        result.port,
-                        config.clone(),
-                        advanced,
-                        seen_ip_ports.clone(),
-                        seen_ips.clone(),
-                        tx.clone(),
-                        pool.clone(),
-                        2,
-                    )
-                    .await;
-                }
-            }
-        }
-    }
 }
 
 pub async fn db_init(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
@@ -1019,14 +914,6 @@ async fn main() {
     );
 
     let (tx, rx) = mpsc::channel::<CompressedTarget>(10000);
-    for target in targets {
-        println!(
-            "🔎 Found target: {}:{}",
-            u32_to_ipv4_string(target.ip),
-            target.port
-        );
-        tx.send(target).await.unwrap();
-    }
 
     // Only spawn one receiver loop, and share the receiver among all tasks
     let rx = Arc::new(Mutex::new(rx));
@@ -1035,7 +922,6 @@ async fn main() {
         let cfg = arc_config.clone();
         let seen_ip_ports = seen_ip_ports.clone();
         let seen_ips = seen_ips.clone();
-        let tx = tx.clone();
         let pool = pool.clone();
 
         tokio::spawn(async move {
@@ -1052,7 +938,6 @@ async fn main() {
                         true,
                         seen_ip_ports.clone(),
                         seen_ips.clone(),
-                        tx.clone(),
                         pool.clone(),
                         0,
                     )
@@ -1062,6 +947,15 @@ async fn main() {
                 }
             }
         });
+    }
+
+    for target in targets {
+        println!(
+            "🔎 Found target: {}:{}",
+            u32_to_ipv4_string(target.ip),
+            target.port
+        );
+        tx.send(target).await.unwrap();
     }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
