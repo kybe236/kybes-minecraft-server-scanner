@@ -22,6 +22,8 @@ public class ScannerModule extends ToggleableModule {
   private final StringSetting dbuser = new StringSetting("Database User", "mc_scanner");
   private final StringSetting dbpassword = new StringSetting("Database Password", "");
   private final StringSetting query = new StringSetting("Query", "SELECT ip FROM servers LIMIT 10");
+  private final BooleanSetting hideIpInName = new BooleanSetting("Hide IP in Name", true);
+
   public ScannerModule() {
     super("Scanner Accessor");
 
@@ -36,6 +38,7 @@ public class ScannerModule extends ToggleableModule {
       ndburl,
       ndbuser,
       ndbpassword,
+      hideIpInName,
       query,
       clearServers
     );
@@ -76,7 +79,11 @@ public class ScannerModule extends ToggleableModule {
         String ip = rs.getString("ip");
         System.out.println("Found IP: " + ip);
 
-        serverList.add(new ServerData(ip, ip, ServerData.Type.OTHER), false);
+        String displayName = ip;
+        if (hideIpInName.getValue()) {
+          displayName = "CENSORED";
+        }
+        serverList.add(new ServerData(displayName , ip, ServerData.Type.OTHER), false);
       }
     } catch (SQLException e) {
       e.printStackTrace();
