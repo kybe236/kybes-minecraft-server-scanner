@@ -6,7 +6,7 @@
 ## DB
 - install [postgresql](https://www.postgresql.org/)
 - create a user (i recommend mc_scanner)
-- cratea a db (i recommend mc_scanner)
+- create a db (i recommend mc_scanner)
 - make sure the user has full acess over that db and is allowed to remotly log in
 ## Scanner
 - edit the config
